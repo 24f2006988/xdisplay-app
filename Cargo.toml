@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = [
+    "common",
+    "host",
+]
+exclude = [
+    "client/native",
+]
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+# Keep dependencies (openh264's C code, windows-capture) optimized even in debug builds.
+[profile.dev.package."*"]
+opt-level = 2

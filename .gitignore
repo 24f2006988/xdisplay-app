@@ -1,0 +1,23 @@
+**/target/
+target/
+**/*.rs.bk
+*.pdb
+*.exe
+.idea/
+.gradle/
+**/build/
+build/
+local.properties
+test_capture_out.txt
+# Screenshots, prebuilt native libs and local scratch
+/tablet_*.png
+*.so
+client/app/src/main/jniLibs/
+
+# Signing keys and their passwords never go into the repository
+keystore.properties
+*.jks
+*.keystore
+
+# Release output
+/dist/

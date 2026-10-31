@@ -1,0 +1,14 @@
+* text=auto eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+*.iss text eol=crlf
+*.rc text eol=crlf
+gradlew text eol=lf
+*.png binary
+*.ico binary
+*.jar binary
+*.msi binary
+*.dll binary
+*.cat binary
+*.inf binary
