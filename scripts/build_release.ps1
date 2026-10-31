@@ -75,7 +75,8 @@ $lines = foreach ($f in $files) {
     $hash = (Get-FileHash (Join-Path $dist $f) -Algorithm SHA256).Hash.ToLower()
     "$hash  $f"
 }
-Set-Content -Path (Join-Path $dist "SHA256SUMS.txt") -Value $lines -Encoding ascii
+# LF line endings, so `sha256sum -c SHA256SUMS.txt` works on Linux and macOS too.
+[System.IO.File]::WriteAllText((Join-Path $dist "SHA256SUMS.txt"), (($lines -join "`n") + "`n"))
 $lines | ForEach-Object { Write-Host "  $_" }
 
 Write-Host ""
