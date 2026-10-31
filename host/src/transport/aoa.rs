@@ -5,9 +5,13 @@
 //! two bulk endpoints are then bridged to the host's own TCP server on loopback, so the session
 //! (handshake, video, input) is exactly the one used over adb or Wi-Fi.
 //!
-//! Windows binds a tablet with debugging off to its MTP driver, so plain WinUSB cannot send it
-//! the accessory request. libusb's UsbDk backend can: UsbDk (a signed filter driver installed
-//! with XDisplay) hands the device to us while we hold it. Without UsbDk this module stays off.
+//! The switch request goes through libusb's WinUSB backend, which reaches a tablet whose adb
+//! interface is bound to WinUSB (USB debugging on). With debugging off Windows binds the tablet
+//! to its MTP driver only, and WinUSB cannot send it the request. UsbDk can, but it is a filter
+//! on every USB stack: it blue-screened Windows on unplug (0x10D) and its redirect makes a
+//! tablet whose MTP driver failed at boot come back as "USB device not recognized" (code 43).
+//! It is therefore used only when `XDISPLAY_ENABLE_USBDK=1` is set, and 1.0.1+ installers no
+//! longer install it.
 
 use crate::shared::HostShared;
 use rusb::{Context, Device, DeviceHandle, Direction, TransferType, UsbContext, UsbOption};
@@ -17,7 +21,7 @@ use std::net::{Shutdown, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 pub const GOOGLE_VID: u16 = 0x18D1;
@@ -44,9 +48,17 @@ pub const XDISPLAY_URI: &str = "https://github.com/24f2006988/xdisplay\0";
 pub const XDISPLAY_SERIAL: &str = "1\0";
 
 const SCAN_INTERVAL: Duration = Duration::from_secs(1);
-/// Scans to wait for a Windows (WinUSB) driver to claim a freshly switched accessory before
-/// falling back to UsbDk.
-const ACCESSORY_DRIVER_GRACE_SCANS: u32 = 6;
+/// Switch attempts per plug-in. Right after logon or a restart the tablet is often listed
+/// before Windows has bound its drivers, so the first request can fail; one try per plug-in
+/// used to leave the tablet unswitched until it was unplugged and plugged in again.
+const MAX_SWITCH_TRIES: u32 = 6;
+/// Wait after a failed attempt: doubles each time, from this...
+const SWITCH_RETRY_BASE: Duration = Duration::from_secs(2);
+/// ...up to this.
+const SWITCH_RETRY_MAX: Duration = Duration::from_secs(30);
+/// A tablet that accepted the request but is still in normal mode on that port after this long
+/// did not make it into accessory mode (re-enumeration failed); ask again.
+const SWITCH_SETTLE: Duration = Duration::from_secs(15);
 const CONTROL_TIMEOUT: Duration = Duration::from_millis(500);
 /// Bulk reads wake up this often to notice that the other direction has ended.
 const POLL_TIMEOUT: Duration = Duration::from_millis(200);
@@ -166,71 +178,80 @@ fn port_key(device: &Device<Context>) -> (u8, Vec<u8>) {
     (device.bus_number(), device.port_numbers().unwrap_or_default())
 }
 
-/// Starts the background plug-and-play USB manager. Returns immediately; does nothing beyond a
-/// log line when UsbDk is not installed.
+/// Starts the background plug-and-play USB manager.
 pub fn spawn_aoa_manager(shared: Arc<HostShared>) {
     let spawned = thread::Builder::new().name("xdisplay-aoa".into()).spawn(move || {
-        let usbdk = match Context::with_options(&[UsbOption::use_usbdk()]) {
-            Ok(context) => Some(context),
-            Err(e) => {
-                info!("Plug-and-play USB (no USB debugging) unavailable: UsbDk driver not installed ({e})");
-                None
-            }
-        };
-        // libusb's default backend reaches devices bound to WinUSB. Some PCs bind the accessory
-        // device (18D1:2D0x) to WinUSB as a whole (SuperDisplay's driver does), and UsbDk cannot
-        // open those; it may also switch a tablet whose adb interface is on WinUSB.
-        let winusb = Context::new().ok();
-        if usbdk.is_none() && winusb.is_none() {
+        // Poll, switch and bridge through libusb's WinUSB backend only (see the module docs for
+        // why UsbDk is opt-in).
+        let Ok(winusb) = Context::new() else {
             return;
-        }
-        if usbdk.is_some() {
-            info!("Plug-and-play USB ready: tablets are switched to accessory mode when plugged in");
-        }
-        run_manager(usbdk, winusb, shared);
+        };
+        info!(
+            "Plug-and-play USB ready: tablets are switched to accessory mode when plugged in{}",
+            if usbdk_enabled() { " (UsbDk fallback enabled)" } else { "" }
+        );
+        run_manager(winusb, shared);
     });
     if let Err(e) = spawned {
         warn!("Could not start the USB accessory manager: {e}");
     }
 }
 
-fn run_manager(usbdk: Option<Context>, winusb: Option<Context>, shared: Arc<HostShared>) {
-    // Ports already asked to switch: one request per plug-in, so a tablet that declines (or
-    // lacks the app) is not reset every second. Cleared when the port empties or once the
-    // tablet has reached accessory mode on it.
-    let mut requested: HashSet<(u8, Vec<u8>)> = HashSet::new();
-    // Scans an accessory device has been seen on a port without a bridge (see the grace below).
+/// Switch attempts made on one port during the current plug-in.
+#[derive(Debug, Default)]
+struct SwitchAttempts {
+    tries: u32,
+    /// No new attempt before this.
+    next_at: Option<Instant>,
+    /// The device cannot do AOA (or we gave up): leave it alone until it is unplugged.
+    given_up: bool,
+}
+
+impl SwitchAttempts {
+    fn due(&self, now: Instant) -> bool {
+        !self.given_up && self.next_at.is_none_or(|t| now >= t)
+    }
+
+    /// Records the outcome of an attempt and returns whether more attempts will follow.
+    fn record(&mut self, outcome: &rusb::Result<u16>, now: Instant) -> bool {
+        self.tries += 1;
+        let wait = match outcome {
+            // START was accepted: the tablet should be back as an accessory within seconds.
+            Ok(_) => SWITCH_SETTLE,
+            // Not an AOA device: retrying cannot help.
+            Err(rusb::Error::NotSupported) => {
+                self.given_up = true;
+                return false;
+            }
+            Err(_) => SWITCH_RETRY_BASE
+                .saturating_mul(1 << (self.tries - 1).min(8))
+                .min(SWITCH_RETRY_MAX),
+        };
+        if self.tries >= MAX_SWITCH_TRIES {
+            self.given_up = true;
+            return false;
+        }
+        self.next_at = Some(now + wait);
+        true
+    }
+}
+
+fn run_manager(winusb: Context, shared: Arc<HostShared>) {
+    // Switch attempts per port in normal mode, so a tablet that declines (or lacks the app) is
+    // not reset every second, yet a failed attempt is retried. Cleared when the port empties or
+    // once the tablet has reached accessory mode on it.
+    let mut requested: HashMap<(u8, Vec<u8>), SwitchAttempts> = HashMap::new();
     let mut accessory_scans: HashMap<(u8, Vec<u8>), u32> = HashMap::new();
     let bridge_active = Arc::new(AtomicBool::new(false));
-    let mut list_failed_logged = false;
 
     while shared.is_running.load(Ordering::Relaxed) {
         thread::sleep(SCAN_INTERVAL);
-        let winusb_devices: Option<Vec<Device<Context>>> =
-            winusb.as_ref().and_then(|c| c.devices().ok()).map(|list| list.iter().collect());
-        // Switching needs UsbDk for tablets on the MTP driver; without it only WinUSB-bound
-        // devices (adb) can be switched.
-        let mut listed_by_usbdk = true;
-        let devices: Vec<Device<Context>> = match usbdk.as_ref().map(|c| c.devices()) {
-            Some(Ok(devices)) => devices.iter().collect(),
-            other => {
-                listed_by_usbdk = false;
-                if let Some(Err(e)) = other {
-                    // UsbDk attaches to the USB controllers only when they start: right after
-                    // it is installed, listing fails until Windows restarts.
-                    if !list_failed_logged {
-                        warn!("Plug-and-play USB cannot list devices ({e}); restart Windows once after installing XDisplay");
-                        list_failed_logged = true;
-                    }
-                }
-                match &winusb_devices {
-                    Some(devices) => devices.clone(),
-                    None => continue,
-                }
-            }
+        let Ok(device_list) = winusb.devices() else {
+            continue;
         };
+        let devices: Vec<Device<Context>> = device_list.iter().collect();
         let present: HashSet<_> = devices.iter().map(port_key).collect();
-        requested.retain(|port| present.contains(port));
+        requested.retain(|port, _| present.contains(port));
         accessory_scans.retain(|port, _| present.contains(port));
 
         for device in devices {
@@ -251,33 +272,16 @@ fn run_manager(usbdk: Option<Context>, winusb: Option<Context>, shared: Arc<Host
                 if *scans == 1 {
                     info!("Tablet in accessory mode (18D1:{:04X}); opening the USB bridge", desc.product_id());
                 }
-                // Prefer WinUSB on the same port. Right after the switch Windows may still be
-                // binding its driver, so the open is retried each scan for a while; a WinUSB
-                // open never blocks. UsbDk is the fallback for an accessory interface that no
-                // Windows driver claims, and it cannot open (it hangs on) one WinUSB owns.
-                let winusb_candidates: Vec<Device<Context>> = if listed_by_usbdk {
-                    winusb_devices.iter().flatten().filter(|d| port_key(d) == port).cloned().collect()
-                } else {
-                    vec![device.clone()] // this list already came from WinUSB
-                };
-                let opened = open_accessory(winusb_candidates).ok();
-                let usbdk_fallback = match opened {
-                    Some(_) => None,
-                    None if listed_by_usbdk && *scans >= ACCESSORY_DRIVER_GRACE_SCANS => Some(device),
-                    None => continue,
+                // Right after the switch Windows may still be binding WinUSB to 18D1:2D0x, so
+                // retry on subsequent scans until WinUSB can open and claim the interface.
+                let Ok(opened) = open_accessory(vec![device]) else {
+                    continue;
                 };
                 accessory_scans.remove(&port);
                 bridge_active.store(true, Ordering::Release);
                 let (shared, active) = (shared.clone(), bridge_active.clone());
                 thread::spawn(move || {
-                    let result = match (opened, usbdk_fallback) {
-                        (Some(opened), _) => bridge(opened, &shared),
-                        (None, Some(device)) => {
-                            open_accessory(vec![device]).map_err(Into::into).and_then(|o| bridge(o, &shared))
-                        }
-                        (None, None) => Ok(()),
-                    };
-                    if let Err(e) = result {
+                    if let Err(e) = bridge(opened, &shared) {
                         info!("USB accessory bridge ended: {e}");
                     }
                     active.store(false, Ordering::Release);
@@ -286,33 +290,69 @@ fn run_manager(usbdk: Option<Context>, winusb: Option<Context>, shared: Arc<Host
             }
 
             let port = port_key(&device);
-            // Never reset the USB link of a tablet that is connecting or streaming (over adb).
-            if requested.contains(&port) || usb_busy(&shared) {
+            let now = Instant::now();
+            // Never reset the USB link of a tablet that is connecting or streaming over USB.
+            if requested.get(&port).is_some_and(|a| !a.due(now)) || usb_busy(&shared) {
                 continue;
             }
             if !looks_like_android(&device) {
                 continue;
             }
-            requested.insert(port);
-            match request_accessory_mode(&device, || usb_busy(&shared)) {
-                Ok(version) => info!(
-                    "Asked {:04X}:{:04X} to switch to accessory mode (AOA v{version})",
-                    desc.vendor_id(),
-                    desc.product_id()
+            let (vid, pid) = (desc.vendor_id(), desc.product_id());
+            let switch_res = request_accessory_mode(&device, || usb_busy(&shared)).or_else(|e| {
+                if !usbdk_enabled() {
+                    return Err(e);
+                }
+                debug!("WinUSB could not switch {vid:04X}:{pid:04X} ({e}); trying UsbDk");
+                request_accessory_mode_via_usbdk(vid, pid, || usb_busy(&shared))
+            });
+            let attempts = requested.entry(port).or_default();
+            let again = attempts.record(&switch_res, Instant::now());
+            match (&switch_res, again) {
+                (Ok(version), _) => {
+                    info!("Asked {vid:04X}:{pid:04X} to switch to accessory mode (AOA v{version})")
+                }
+                // Busy: a USB session started meanwhile, which is the goal anyway.
+                (Err(rusb::Error::Busy), _) => {}
+                (Err(e), true) => debug!(
+                    "{vid:04X}:{pid:04X} did not switch to accessory mode yet ({e}); retry {}/{MAX_SWITCH_TRIES}",
+                    attempts.tries
                 ),
-                Err(e) => debug!(
-                    "{:04X}:{:04X} did not switch to accessory mode: {e}",
-                    desc.vendor_id(),
-                    desc.product_id()
+                (Err(e), false) if attempts.tries > 1 => info!(
+                    "{vid:04X}:{pid:04X} did not switch to accessory mode after {} tries ({e}). With USB \
+                     debugging off this needs the tablet's adb interface; enable USB debugging or use Wi-Fi",
+                    attempts.tries
                 ),
+                (Err(e), false) => debug!("{vid:04X}:{pid:04X} cannot use accessory mode: {e}"),
             }
         }
     }
 }
 
-/// A tablet session is connecting or running over USB (adb), or over our own bridge.
+/// A tablet session is connecting or running over USB (adb or our own accessory bridge).
 fn usb_busy(shared: &HostShared) -> bool {
-    shared.client_connected.load(Ordering::Relaxed) || shared.usb_links.load(Ordering::Acquire) > 0
+    shared.usb_links.load(Ordering::Acquire) > 0
+}
+
+/// UsbDk fallback for MTP-only tablets (USB debugging off). Opt-in; see the module docs.
+fn usbdk_enabled() -> bool {
+    std::env::var_os("XDISPLAY_ENABLE_USBDK").is_some_and(|v| v == "1")
+}
+
+/// Uses a temporary UsbDk context only for the control transfer that switches an MTP-bound
+/// tablet into accessory mode, then drops it so the session itself runs over WinUSB.
+fn request_accessory_mode_via_usbdk(vid: u16, pid: u16, abort: impl Fn() -> bool) -> rusb::Result<u16> {
+    let usbdk = Context::with_options(&[UsbOption::use_usbdk()])?;
+    let devices = usbdk.devices()?;
+    for device in devices.iter() {
+        let Ok(desc) = device.device_descriptor() else {
+            continue;
+        };
+        if desc.vendor_id() == vid && desc.product_id() == pid {
+            return request_accessory_mode(&device, abort);
+        }
+    }
+    Err(rusb::Error::NotFound)
 }
 
 /// Sends the AOA identification strings and START. The device then disconnects and comes back
@@ -588,6 +628,48 @@ mod tests {
         assert_eq!(AOA_STR_MODEL, 1);
         assert!(XDISPLAY_MANUFACTURER.ends_with('\0'));
         assert!(XDISPLAY_MODEL.ends_with('\0'));
+    }
+
+    #[test]
+    fn failed_switch_is_retried_with_backoff_then_given_up() {
+        let t0 = Instant::now();
+        let mut a = SwitchAttempts::default();
+        assert!(a.due(t0));
+        // Drivers not bound yet right after logon.
+        assert!(a.record(&Err(rusb::Error::NotFound), t0));
+        assert!(!a.due(t0 + Duration::from_millis(1900)));
+        assert!(a.due(t0 + SWITCH_RETRY_BASE));
+        assert!(a.record(&Err(rusb::Error::Io), t0));
+        assert_eq!(a.next_at, Some(t0 + SWITCH_RETRY_BASE * 2));
+        for _ in 2..MAX_SWITCH_TRIES - 1 {
+            assert!(a.record(&Err(rusb::Error::Io), t0));
+            assert!(a.next_at.unwrap() - t0 <= SWITCH_RETRY_MAX);
+        }
+        assert!(!a.record(&Err(rusb::Error::Io), t0));
+        assert!(!a.due(t0 + Duration::from_secs(3600)));
+    }
+
+    #[test]
+    fn accepted_switch_is_resent_only_if_the_tablet_never_became_an_accessory() {
+        let t0 = Instant::now();
+        let mut a = SwitchAttempts::default();
+        assert!(a.record(&Ok(2), t0));
+        assert!(!a.due(t0 + Duration::from_secs(5)));
+        assert!(a.due(t0 + SWITCH_SETTLE));
+    }
+
+    #[test]
+    fn device_without_aoa_is_left_alone() {
+        let mut a = SwitchAttempts::default();
+        assert!(!a.record(&Err(rusb::Error::NotSupported), Instant::now()));
+        assert!(!a.due(Instant::now() + Duration::from_secs(3600)));
+    }
+
+    #[test]
+    fn usbdk_is_off_by_default() {
+        if std::env::var_os("XDISPLAY_ENABLE_USBDK").is_none() {
+            assert!(!usbdk_enabled());
+        }
     }
 
     #[test]

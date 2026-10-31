@@ -57,17 +57,13 @@ if (Test-Path $drv) {
         else { Warn "Virtual display not active yet."; $todo.Add("Run setup.bat again and accept the administrator prompt (or reboot once).") }
     }
 }
-# UsbDk lets the host switch a tablet with USB debugging off into accessory mode (plug and play).
+# UsbDk is no longer used or installed: it is a filter on every USB stack and blue-screened
+# Windows (0x10D) when a device was unplugged. Earlier versions installed it; flag it for removal.
 if (Get-Service UsbDk -ErrorAction SilentlyContinue) {
-    Ok "Plug-and-play USB driver (UsbDk) is installed."
+    Warn "The UsbDk USB driver from an earlier XDisplay is installed. It can crash Windows when a USB device is unplugged."
+    $todo.Add("Uninstall 'UsbDk Runtime Libraries' in Settings > Apps, then restart Windows. XDisplay no longer needs it.")
 } else {
-    $usbDk = @("installer\redist", "redist") | ForEach-Object { Join-Path $root "$_\UsbDk_1.0.22_x64.msi" } | Where-Object { Test-Path $_ } | Select-Object -First 1
-    if ($usbDk) {
-        Write-Host "       Installing the plug-and-play USB driver (Windows will ask for administrator permission)..." -ForegroundColor Gray
-        Start-Process msiexec.exe -Verb RunAs -Wait -ArgumentList "/i `"$usbDk`" /qn /norestart"
-    }
-    if (Get-Service UsbDk -ErrorAction SilentlyContinue) { Ok "Plug-and-play USB driver (UsbDk) installed."; $todo.Add("Restart Windows once so the plug-and-play USB driver attaches to the USB ports.") }
-    else { Warn "Plug-and-play USB driver not installed; USB needs USB debugging (or use Wi-Fi)." }
+    Ok "USB works over USB debugging (adb); no extra driver needed."
 }
 
 # 2. Firewall

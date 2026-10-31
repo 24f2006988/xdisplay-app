@@ -1,4 +1,4 @@
-﻿use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Result};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -464,6 +464,8 @@ pub struct CaptureContext {
     pub shared: Arc<HostShared>,
     pub fps: u32,
     pub state: Arc<Mutex<EncoderState>>,
+    pub hmonitor: usize,
+    pub is_virtual: bool,
 }
 
 /// A frame arriving this much before its slot is still accepted, so timing noise does not skip
@@ -493,6 +495,9 @@ struct ScreenCaptureHandler {
     #[allow(dead_code)]
     fps: u32,
     state: Arc<Mutex<EncoderState>>,
+    hmonitor: usize,
+    is_virtual: bool,
+    last_monitor_check: Instant,
 }
 
 impl GraphicsCaptureApiHandler for ScreenCaptureHandler {
@@ -505,6 +510,9 @@ impl GraphicsCaptureApiHandler for ScreenCaptureHandler {
             shared: ctx.flags.shared,
             fps: ctx.flags.fps,
             state: ctx.flags.state,
+            hmonitor: ctx.flags.hmonitor,
+            is_virtual: ctx.flags.is_virtual,
+            last_monitor_check: Instant::now(),
         })
     }
 
@@ -516,6 +524,20 @@ impl GraphicsCaptureApiHandler for ScreenCaptureHandler {
         if !self.shared.is_running.load(Ordering::Relaxed) || (virtual_display::is_detached() && !self.shared.client_connected.load(Ordering::Relaxed)) {
             capture_control.stop();
             return Ok(());
+        }
+        let target_hmon = self.shared.display.lock().unwrap_or_else(|e| e.into_inner()).hmonitor;
+        if target_hmon != 0 && target_hmon != self.hmonitor {
+            info!("Target display handle changed; switching WGC capture to new monitor");
+            capture_control.stop();
+            return Ok(());
+        }
+        if !self.is_virtual && self.last_monitor_check.elapsed() >= Duration::from_millis(500) {
+            self.last_monitor_check = Instant::now();
+            if Monitor::enumerate().ok().is_some_and(|ms| ms.iter().any(is_virtual_monitor)) {
+                info!("Virtual display is now active; switching WGC capture from fallback monitor to virtual display");
+                capture_control.stop();
+                return Ok(());
+            }
         }
 
         let width = frame.width() & !1;
@@ -819,11 +841,22 @@ pub fn start_wgc_capture(video_tx: Sender<VideoPacket>, shared: Arc<HostShared>)
                     }
                 };
 
+                let is_virtual = is_virtual_monitor(&monitor);
+                *cap_shared.display.lock().unwrap_or_else(|e| e.into_inner()) = disp_info;
+                cap_shared
+                    .injector
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .set_monitor_rect(disp_info.left, disp_info.top, disp_info.width, disp_info.height);
+                cap_shared.request_idr.store(true, Ordering::Relaxed);
+
                 let ctx = CaptureContext {
                     video_tx: cap_video_tx.clone(),
                     shared: cap_shared.clone(),
                     fps: disp_info.stream_fps(),
                     state: cap_state.clone(),
+                    hmonitor: disp_info.hmonitor,
+                    is_virtual,
                 };
 
                 let settings = |interval: MinimumUpdateIntervalSettings| {

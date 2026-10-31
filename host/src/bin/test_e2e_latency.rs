@@ -279,11 +279,18 @@ async fn main() -> Result<()> {
 
     let test_port = 59199u16;
     let display = ActiveDisplayInfo { hmonitor: 0, left: 1920, top: 0, width: 1800, height: 1200, refresh_hz: 120 };
-    let shared = Arc::new(HostShared::new(PointerInjector::new(1800, 1200)?, display));
+    // In-memory pairing store (never the user's real pairing.conf). This process connects over
+    // loopback, so it is treated as the USB accessory bridge: a new tablet there needs the
+    // user's approval, which this benchmark grants automatically.
+    let store = Arc::new(transport::PairingStore::load(None));
+    store.set_usb_approver(Arc::new(|_name: &str| true));
+    let shared = Arc::new(HostShared::with_pairing(PointerInjector::new(1800, 1200)?, display, store));
     let (video_tx, video_rx) = mpsc::channel(16);
 
     let server = TransportServer::bind(test_port, shared.clone()).await?;
     let test_port = server.port();
+    // The loopback trust check looks the connection up by the port the host really listens on.
+    shared.tcp_port.store(test_port, std::sync::atomic::Ordering::Relaxed);
     let server_handle = tokio::spawn(async move {
         let _ = server.run(video_rx).await;
     });
@@ -313,8 +320,8 @@ async fn main() -> Result<()> {
     client.write_all(&hello_bytes).await?;
     client.flush().await?;
 
-    // Step B: Receive HelloAck (loopback is trusted, so no authentication follows), then
-    // the ServerConfig response from host
+    // Step B: Receive HelloAck (approved USB tablet, so no authentication follows), the new
+    // device secret, then the ServerConfig response from host
     let mut ctrl_msg;
     let mut resp_hdr_buf = [0u8; HEADER_SIZE];
     loop {
@@ -325,7 +332,7 @@ async fn main() -> Result<()> {
         let mut resp_payload = vec![0u8; resp_hdr.payload_len as usize];
         client.read_exact(&mut resp_payload).await?;
         ctrl_msg = bincode::deserialize::<ControlMessage>(&resp_payload)?;
-        if !matches!(ctrl_msg, ControlMessage::HelloAck(_)) {
+        if !matches!(ctrl_msg, ControlMessage::HelloAck(_) | ControlMessage::PairingComplete { .. }) {
             break;
         }
     }

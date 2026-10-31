@@ -87,10 +87,9 @@ set "HOST_EXE=%REPO_ROOT%\target\release\xdisplay-host.exe"
 
 tasklist /fi "imagename eq xdisplay-host.exe" 2>nul | findstr /i "xdisplay-host.exe" >nul 2>&1
 if %ERRORLEVEL% equ 0 (
-    echo [OK] XDisplay Host is already running!
-    echo       GUI Dashboard and system tray icon are active.
-    pause
-    exit /b 0
+    echo [INFO] Restarting existing XDisplay Host instance to refresh USB ^& display state...
+    taskkill /f /im xdisplay-host.exe >nul 2>&1
+    timeout /t 1 /nobreak >nul
 )
 
 if not exist "%HOST_EXE%" (

@@ -22,8 +22,10 @@ tilt.
 
 - **A real second monitor.** A virtual display driver gives Windows an extra screen sized to your
   device's panel (1:1 pixels when the resolution is known, 60 to 144 Hz).
-- **USB, plug and play.** Plug in the cable and accept "Open XDisplay?" on the device. No USB
-  debugging needed (USB debugging with adb works too).
+- **USB.** Turn on USB debugging on the device and plug in the cable. The first time, the PC asks
+  whether to allow the device; after that it reconnects by itself. (Version 1.0.0 also worked with
+  USB debugging off through the UsbDk driver; that was removed in 1.0.1 because UsbDk could crash
+  Windows when the cable was unplugged.)
 - **Wi-Fi.** PCs on the network show up on the device automatically. Pair once with a 6-digit PIN;
   after that the connection is encrypted and reconnects by itself.
 - **Pen and touch.** Pressure curves, tilt, hover, barrel button as right-click or eraser, palm
@@ -45,16 +47,18 @@ tilt.
 
 1. **Windows:** download `XDisplay-Setup-<version>.exe` from
    [Releases](https://github.com/24f2006988/xdisplay-app/releases/latest) and run it. It installs
-   the app, the virtual display driver, the Wi-Fi firewall rules and (optionally) the plug-and-play
-   USB driver. Restart Windows if it asks you to.
+   the app, the virtual display driver and the Wi-Fi firewall rules. Upgrading from 1.0.0, keep
+   "Remove the UsbDk USB driver" ticked. Restart Windows if it asks you to.
 2. **Android:** download `XDisplay-<version>.apk` on the device and open it (allow "install unknown
    apps" for your browser or file manager when asked). The installer also puts a copy in
    `C:\Program Files\XDisplay\android\`.
 3. Start **XDisplay** on the PC (Start menu). It runs in the system tray; click the tray icon for
    the dashboard.
 4. Connect:
-   - **USB:** plug the device in and tap **OK** on "Open XDisplay for this USB accessory?". Tick
-     "always" to skip the question next time.
+   - **USB:** turn on **USB debugging** (Settings > Developer options), plug the device in, and
+     allow the computer on the device if asked. The first time, choose **Yes** in the "allow new
+     USB tablet?" prompt on the PC. If the device asks "Open XDisplay for this USB accessory?",
+     tap **OK** (tick "always").
    - **Wi-Fi:** open XDisplay on the device, tap your PC under **PCs on this Wi-Fi** (or type the
      PC's IP address), and enter the PIN shown on the PC's dashboard. You only do this once.
 

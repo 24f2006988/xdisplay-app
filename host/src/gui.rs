@@ -115,6 +115,39 @@ fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
     COLORREF((r as u32) | ((g as u32) << 8) | ((b as u32) << 16))
 }
 
+#[link(name = "user32")]
+extern "system" {
+    /// Exported by user32 since Windows XP (undocumented but stable): a MessageBox that
+    /// closes itself after `milliseconds`, returning 32000.
+    fn MessageBoxTimeoutW(hwnd: HWND, text: PCWSTR, caption: PCWSTR, style: u32, language: u16, milliseconds: u32) -> i32;
+}
+
+/// Asks the user whether a tablet that just appeared on USB may use this PC. Blocks until the
+/// user answers or `USB_APPROVAL_TIMEOUT` passes (then: no). "No" is the default button, so a
+/// stray Enter does not admit anything.
+pub fn usb_approval_prompt(device_name: &str) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        IDYES, MB_DEFBUTTON2, MB_ICONWARNING, MB_SETFOREGROUND, MB_TOPMOST, MB_YESNO,
+    };
+    let text = to_wide_null(&format!(
+        "A tablet named \"{device_name}\" connected over USB and wants to use this PC: \
+         see its screen and control the keyboard, mouse and pen.\n\n\
+         Allow it?\n\n\
+         Choose Yes only if you just connected your own tablet. Any app installed on a tablet \
+         can use its USB link. You will only be asked once per tablet; \"Forget tablets\" on \
+         the dashboard revokes it.\n\n\
+         (No answer within {} seconds counts as No.)",
+        crate::transport::pairing::USB_APPROVAL_TIMEOUT.as_secs()
+    ));
+    let caption = to_wide_null("XDisplay: allow new USB tablet?");
+    let style = (MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2 | MB_TOPMOST | MB_SETFOREGROUND).0;
+    let ms = crate::transport::pairing::USB_APPROVAL_TIMEOUT.as_millis() as u32;
+    let answer = unsafe {
+        MessageBoxTimeoutW(HWND::default(), PCWSTR(text.as_ptr()), PCWSTR(caption.as_ptr()), style, 0, ms)
+    };
+    answer == IDYES.0
+}
+
 fn find_adb_executable() -> Option<std::path::PathBuf> {
     // 1. App-relative paths (portable / installed bundle)
     if let Ok(exe_path) = std::env::current_exe() {
@@ -716,7 +749,12 @@ unsafe fn paint_dashboard(hwnd: HWND, hdc: HDC) {
     SelectObject(hdc, font_small);
     SetTextColor(hdc, text_muted);
     let pin_hint = RECT { left: 38, top: PAIRING_CARD.top + 56, right: 240, bottom: PAIRING_CARD.top + 74 };
-    draw_text_helper(hdc, "Enter once on a new tablet", &pin_hint, DT_LEFT | DT_SINGLELINE);
+    // After repeated wrong PINs pairing is paused (brute-force guard); New PIN resumes it.
+    let hint = match shared.pairing.pairing_paused() {
+        Some(left) => format!("Paused {}s after wrong PINs: New PIN", left.as_secs().max(1)),
+        None => "Enter once on a new tablet".to_string(),
+    };
+    draw_text_helper(hdc, &hint, &pin_hint, DT_LEFT | DT_SINGLELINE);
 
     let addrs = lan_addresses();
     let addr_text = if addrs.is_empty() {
@@ -956,7 +994,7 @@ unsafe fn handle_click(hwnd: HWND, x: i32, y: i32) {
                         set_status("No paired tablets to forget");
                     } else {
                         let text = to_wide_null(&format!(
-                            "Forget {count} paired tablet(s)? They will need the PIN again to reconnect over Wi-Fi."
+                            "Forget {count} paired tablet(s)? They will need the PIN again over Wi-Fi, or your approval again over USB."
                         ));
                         let title = to_wide_null("XDisplay");
                         let answer = MessageBoxW(hwnd, PCWSTR(text.as_ptr()), PCWSTR(title.as_ptr()), MB_YESNO | MB_ICONQUESTION);

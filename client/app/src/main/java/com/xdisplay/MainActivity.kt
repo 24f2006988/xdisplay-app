@@ -188,7 +188,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback, View.OnTouchListener, V
             (status == NativeEngine.STATUS_AUTH_FAILED && pinUsed.isNotEmpty())
         NativeEngine.stopClient()
         startActivity(
-            Intent(this, ConnectActivity::class.java)
+            InternalIntents.mark(Intent(this, ConnectActivity::class.java))
                 .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
                 .putExtra(ConnectActivity.EXTRA_MESSAGE, message)
                 .putExtra(ConnectActivity.EXTRA_ERROR, status == NativeEngine.STATUS_AUTH_FAILED)
@@ -238,7 +238,13 @@ class MainActivity : Activity(), SurfaceHolder.Callback, View.OnTouchListener, V
         aoaBridge?.close()
         aoaBridge = null
 
-        val host = intent.getStringExtra(EXTRA_HOST)
+        // A network target and PIN are accepted only from our own ConnectActivity: this activity
+        // is exported, and another app must not be able to point it at a PC it controls.
+        val internal = InternalIntents.isInternal(intent)
+        if (!internal && (intent.hasExtra(EXTRA_HOST) || intent.hasExtra(EXTRA_PIN))) {
+            Log.w("MainActivity", "Ignoring connection extras from an external caller")
+        }
+        val host = if (internal) intent.getStringExtra(EXTRA_HOST) else null
         target = if (accessory != null && usbManager != null) {
             try {
                 val bridge = AoaBridge(usbManager, accessory)
@@ -254,7 +260,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback, View.OnTouchListener, V
         } else {
             Target.USB
         }
-        pinUsed = intent.getStringExtra(EXTRA_PIN) ?: ""
+        pinUsed = if (internal) intent.getStringExtra(EXTRA_PIN) ?: "" else ""
         leaving = false
 
         inkOverlayView.targetLabel = target.label

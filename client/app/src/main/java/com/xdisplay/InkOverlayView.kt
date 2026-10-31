@@ -1524,6 +1524,14 @@ class InkOverlayView(context: Context) : View(context) {
         canvas.drawText(statusText, centerX - badgeW / 2f + 32f * density, badgeRect.centerY() + 4.5f * density, landingStatusTextPaint)
         canvas.restore()
 
+        // A new tablet on USB waits for the user to approve it at the PC.
+        if (isConnecting && isUsbLink) {
+            landingSubPaint.textSize = 11f * density
+            landingSubPaint.color = Color.rgb(170, 185, 205)
+            landingSubPaint.textAlign = Paint.Align.CENTER
+            canvas.drawText("First time on this PC? Choose Yes in the prompt on the PC.", centerX, badgeRect.bottom + 18f * density, landingSubPaint)
+        }
+
         // Device specifications footer chips
         val chipY = centerY + 145f * density
         val chipText1 = "🖥  ${width} × ${height}"

@@ -61,6 +61,9 @@ pub fn detach() {
 
 /// Detaches the virtual monitor if `still_wanted` holds once no attach can run concurrently.
 pub fn detach_if(still_wanted: impl FnOnce() -> bool) {
+    if display_changes_disabled() {
+        return;
+    }
     let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if !still_wanted() {
         return;
@@ -90,6 +93,7 @@ fn attach_via_ccd() -> bool {
     use windows::core::w;
 
     const DISPLAYCONFIG_PATH_ACTIVE: u32 = 0x00000001;
+    const DISPLAYCONFIG_PATH_MODE_IDX_INVALID: u32 = 0xffff_ffff;
 
     unsafe {
         if let Ok(hdesk) = OpenDesktopW(w!("Default"), DESKTOP_CONTROL_FLAGS(0), false, 0x01FF) {
@@ -118,6 +122,9 @@ fn attach_via_ccd() -> bool {
 
         let mut activated = false;
         for path in paths[..path_count as usize].iter_mut() {
+            if !path.targetInfo.targetAvailable.as_bool() {
+                continue;
+            }
             let mut target_name = DISPLAYCONFIG_TARGET_DEVICE_NAME::default();
             target_name.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
             target_name.header.size = std::mem::size_of::<DISPLAYCONFIG_TARGET_DEVICE_NAME>() as u32;
@@ -129,7 +136,10 @@ fn attach_via_ccd() -> bool {
                 let friendly_trim = friendly.trim_matches('\0');
                 if friendly_trim.contains("VDD") || friendly_trim.contains("MTT") || friendly_trim.contains("Virtual") {
                     path.flags |= DISPLAYCONFIG_PATH_ACTIVE;
+                    path.sourceInfo.Anonymous.modeInfoIdx = DISPLAYCONFIG_PATH_MODE_IDX_INVALID;
+                    path.targetInfo.Anonymous.modeInfoIdx = DISPLAYCONFIG_PATH_MODE_IDX_INVALID;
                     activated = true;
+                    break;
                 }
             }
         }
@@ -223,62 +233,108 @@ pub fn display_hz_for(panel_hz: u32) -> u32 {
 /// (`panel_w`x`panel_h`) when the driver offers it, so the stream maps 1:1 onto the panel's
 /// pixels instead of being upscaled. Returns false when there is no virtual display driver or
 /// attaching failed.
+/// Test harnesses (`test_security_e2e`) set `XDISPLAY_NO_DISPLAY_CHANGES=1` so driving the real
+/// transport server never attaches, re-modes or detaches the user's virtual monitor.
+fn display_changes_disabled() -> bool {
+    std::env::var_os("XDISPLAY_NO_DISPLAY_CHANGES").is_some_and(|v| v == "1")
+}
+
+fn reload_driver_pipe() -> bool {
+    use std::io::Write;
+    let Ok(mut pipe) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(r"\\.\pipe\MTTVirtualDisplayPipe")
+    else {
+        return false;
+    };
+    let cmd: Vec<u8> = "RELOAD_DRIVER\0"
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    pipe.write_all(&cmd).is_ok()
+}
+
 pub fn attach(panel_hz: u32, panel_w: u32, panel_h: u32) -> bool {
+    if display_changes_disabled() {
+        return false;
+    }
     let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let hz = display_hz_for(panel_hz);
-    if let Some((device, attached)) = find_device() {
-        if attached {
-            if let Some(current) = current_mode(&device) {
-                let wanted = sized_for_panel(&device, Mode { hz, ..current }, panel_w, panel_h);
-                if wanted != current && apply_mode_any_rate(&device, wanted) {
-                    info!(
-                        "Tablet display switched from {}x{} @ {} Hz to {}x{} @ {} Hz",
-                        current.width, current.height, current.hz, wanted.width, wanted.height, wanted.hz
-                    );
+    let Some((mut device, mut attached)) = find_device() else {
+        return false;
+    };
+    if driver_sizes(&device).is_empty() && reload_driver_pipe() {
+        info!("Reloaded MttVDD via pipe because virtual display reported 0 modes");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+            if let Some((dev, att)) = find_device() {
+                device = dev;
+                attached = att;
+                if !driver_sizes(&device).is_empty() {
+                    break;
                 }
             }
-            DETACHED.store(false, Ordering::Relaxed);
-            return true;
         }
     }
 
-    if attach_via_ccd() {
-        DETACHED.store(false, Ordering::Relaxed);
-        info!("Tablet display attached via Windows CCD topology API");
-        // CCD re-activates the path without a mode, so Windows picks one itself (often its
-        // 800x600 fallback). Put the panel's resolution and the saved position back on it.
-        if let Some((device, _)) = find_device() {
-            let base = load_mode().or_else(|| current_mode(&device)).or_else(|| fallback_mode(&device));
-            if let Some(base) = base {
-                let mode = sized_for_panel(&device, Mode { hz, ..base }, panel_w, panel_h);
-                if current_mode(&device) != Some(mode) && !apply_mode_any_rate(&device, mode) {
-                    warn!("Could not set the tablet display to {}x{} @ {} Hz", mode.width, mode.height, mode.hz);
-                }
+    let primary_width = unsafe {
+        windows::Win32::UI::WindowsAndMessaging::GetSystemMetrics(windows::Win32::UI::WindowsAndMessaging::SM_CXSCREEN)
+    };
+
+    if attached {
+        if let Some(current) = current_mode(&device) {
+            let (x, y) = if current.x == 0 && current.y == 0 && primary_width > 0 {
+                (primary_width, 0)
+            } else {
+                (current.x, current.y)
+            };
+            let wanted = sized_for_panel(&device, Mode { x, y, hz, ..current }, panel_w, panel_h);
+            if wanted != current && apply_mode_any_rate(&device, wanted) {
+                info!(
+                    "Tablet display switched from {}x{} @ {} Hz to {}x{} @ {} Hz at {},{}",
+                    current.width, current.height, current.hz, wanted.width, wanted.height, wanted.hz, wanted.x, wanted.y
+                );
             }
         }
+        DETACHED.store(false, Ordering::Relaxed);
         spawn_guard();
         return true;
     }
 
-    let Some((device, _)) = find_device() else {
-        DETACHED.store(false, Ordering::Relaxed);
-        return false;
-    };
-    let mode = load_mode()
-        .or_else(|| fallback_mode(&device))
-        .map(|m| sized_for_panel(&device, Mode { hz, ..m }, panel_w, panel_h));
-    let Some(mode) = mode else {
+    let base = load_mode().or_else(|| fallback_mode(&device));
+    let Some(base) = base else {
         warn!("No display mode known for the tablet display; cannot attach it");
         return false;
     };
-    // If the driver lacks the rate, fall back to whatever rate it picks for the size.
-    if !apply_mode_any_rate(&device, mode) {
+    let (x, y) = if base.x == 0 && base.y == 0 && primary_width > 0 {
+        (primary_width, 0)
+    } else {
+        (base.x, base.y)
+    };
+    let mode = sized_for_panel(&device, Mode { x, y, hz, ..base }, panel_w, panel_h);
+
+    let mut applied = apply_mode_any_rate(&device, mode);
+    if !applied && attach_via_ccd() {
+        info!("Tablet display path activated via Windows CCD topology API");
+        if let Some((dev, _)) = find_device() {
+            device = dev;
+        }
+        applied = apply_mode_any_rate(&device, mode) || find_device().map(|(_, a)| a).unwrap_or(false);
+    }
+    if !applied {
         warn!("Could not attach the tablet display ({}x{} at {},{})", mode.width, mode.height, mode.x, mode.y);
         return false;
     }
+
     let deadline = Instant::now() + Duration::from_secs(3);
     while !find_device().map(|(_, a)| a).unwrap_or(false) && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(50));
+    }
+    if !find_device().map(|(_, a)| a).unwrap_or(false) {
+        warn!("Tablet display mode was staged, but Windows did not attach it to the desktop");
+        return false;
     }
     DETACHED.store(false, Ordering::Relaxed);
     info!("Tablet display attached ({}x{} @ {} Hz at {},{})", mode.width, mode.height, mode.hz, mode.x, mode.y);
@@ -465,8 +521,16 @@ fn current_mode(device: &[u16]) -> Option<Mode> {
 
 /// Used when nothing was saved yet: the registry mode, else the largest mode, right of the primary.
 fn fallback_mode(device: &[u16]) -> Option<Mode> {
-    if let Some(m) = read_mode(device, ENUM_REGISTRY_SETTINGS) {
-        return Some(m);
+    let primary_width = unsafe {
+        windows::Win32::UI::WindowsAndMessaging::GetSystemMetrics(windows::Win32::UI::WindowsAndMessaging::SM_CXSCREEN)
+    };
+    if let Some(m) = read_mode(device, ENUM_REGISTRY_SETTINGS).filter(is_plausible) {
+        let (x, y) = if m.x == 0 && m.y == 0 && primary_width > 0 {
+            (primary_width, 0)
+        } else {
+            (m.x, m.y)
+        };
+        return Some(Mode { x, y, ..m });
     }
     let mut best: Option<Mode> = None;
     for i in 0..512 {
@@ -476,9 +540,6 @@ fn fallback_mode(device: &[u16]) -> Option<Mode> {
             best = Some(m);
         }
     }
-    let primary_width = unsafe {
-        windows::Win32::UI::WindowsAndMessaging::GetSystemMetrics(windows::Win32::UI::WindowsAndMessaging::SM_CXSCREEN)
-    };
     best.map(|m| Mode { x: primary_width, y: 0, ..m })
 }
 

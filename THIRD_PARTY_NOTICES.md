@@ -8,7 +8,6 @@ It includes or redistributes the following third-party components, each under it
 | Component | Use | License | Source |
 |---|---|---|---|
 | Virtual Display Driver (MttVDD) 25.7.23, signed driver package | Gives Windows the extra monitor that is streamed to the device | MIT (`installer/redist/vdd/LICENSE.txt`) | https://github.com/VirtualDrivers/Virtual-Display-Driver |
-| UsbDk 1.0.22 (x64 MSI, signed by Red Hat) | Plug-and-play USB without USB debugging | Apache-2.0 (`installer/redist/UsbDk-LICENSE.txt`) | https://github.com/daynix/UsbDk |
 
 ## Compiled in
 

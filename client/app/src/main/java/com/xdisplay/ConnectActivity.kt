@@ -154,6 +154,9 @@ class ConnectActivity : Activity() {
 
     /** Shows why we are back here and, when the PC asked for a PIN, prompts for it. */
     private fun handleIntent(intent: Intent) {
+        // Only MainActivity may tell us what to show or which host to ask a PIN for; this
+        // activity is exported, so anything else could pop a PIN prompt for a fake PC.
+        if (!InternalIntents.isInternal(intent)) return
         val message = intent.getStringExtra(EXTRA_MESSAGE)
         if (message != null) showMessage(message, error = intent.getBooleanExtra(EXTRA_ERROR, false))
         if (intent.getBooleanExtra(EXTRA_NEED_PIN, false)) {
@@ -178,7 +181,7 @@ class ConnectActivity : Activity() {
         store.lastTarget = target
         store.lastHostId = hostId
         startActivity(
-            Intent(this, MainActivity::class.java)
+            InternalIntents.mark(Intent(this, MainActivity::class.java))
                 .putExtra(MainActivity.EXTRA_HOST, target.host)
                 .putExtra(MainActivity.EXTRA_PORT, target.port)
                 .putExtra(MainActivity.EXTRA_NAME, target.name)

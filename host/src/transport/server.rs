@@ -1,11 +1,12 @@
 use anyhow::{bail, Result};
-use std::net::SocketAddr;
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, Mutex, Semaphore};
+use tokio::sync::{mpsc, Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
@@ -30,8 +31,12 @@ const MAX_CLIENT_PAYLOAD: usize = 64 * 1024;
 const CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(6);
 /// Whole connection handshake, including the pause after a wrong PIN.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(12);
-/// Connections allowed to sit in the handshake at once; extra ones are dropped immediately.
+/// Network connections allowed to sit in the handshake at once; extra ones are dropped immediately.
 const MAX_PENDING_HANDSHAKES: usize = 8;
+/// Pending network handshakes allowed per remote address, so one LAN device cannot take every slot.
+const MAX_PENDING_PER_ADDRESS: usize = 2;
+/// Separate slots for loopback (USB) handshakes: a LAN flood must never lock out the cable.
+const MAX_PENDING_LOOPBACK: usize = 4;
 /// A small kernel send buffer keeps stale video from queueing up on a slow Wi-Fi link.
 const NETWORK_SEND_BUFFER: usize = 256 * 1024;
 /// Highest bitrate the tablet may fix explicitly.
@@ -189,7 +194,7 @@ impl TransportServer {
 /// Accepts connections and authenticates each on its own task, so a stalled or hostile
 /// connection can neither block a real tablet nor hold the active session.
 async fn accept_loop(listener: TcpListener, ready: mpsc::Sender<AuthedConn>, shared: Arc<HostShared>) {
-    let permits = Arc::new(Semaphore::new(MAX_PENDING_HANDSHAKES));
+    let limits = HandshakeLimits::new();
     let host_name = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "Windows PC".to_string());
     loop {
         let (socket, peer) = match listener.accept().await {
@@ -200,7 +205,7 @@ async fn accept_loop(listener: TcpListener, ready: mpsc::Sender<AuthedConn>, sha
                 continue;
             }
         };
-        let Ok(permit) = permits.clone().try_acquire_owned() else {
+        let Some(permit) = limits.admit(peer.ip()) else {
             debug!("Too many pending handshakes; dropping connection from {peer}");
             continue;
         };
@@ -211,7 +216,13 @@ async fn accept_loop(listener: TcpListener, ready: mpsc::Sender<AuthedConn>, sha
         tokio::spawn(async move {
             let _permit = permit;
             info!("Connection from {peer}");
-            match tokio::time::timeout(HANDSHAKE_TIMEOUT, authenticate(socket, peer, &shared, &host_name)).await {
+            // A new USB tablet waits for the user to answer the approval prompt.
+            let limit = if peer.ip().is_loopback() {
+                super::pairing::USB_APPROVAL_TIMEOUT + HANDSHAKE_TIMEOUT
+            } else {
+                HANDSHAKE_TIMEOUT
+            };
+            match tokio::time::timeout(limit, authenticate(socket, peer, &shared, &host_name)).await {
                 Ok(Ok(mut conn)) => {
                     conn.usb_link = usb_link;
                     let _ = ready.send(conn).await;
@@ -220,6 +231,59 @@ async fn accept_loop(listener: TcpListener, ready: mpsc::Sender<AuthedConn>, sha
                 Err(_) => warn!("Connection from {peer} timed out during the handshake"),
             }
         });
+    }
+}
+
+/// Admission control for connections that have not authenticated yet. An unauthenticated peer
+/// can hold a slot for the whole handshake timeout, so without limits a single LAN device could
+/// open a handful of idle sockets and keep every real tablet (USB included) from connecting.
+struct HandshakeLimits {
+    network: Arc<Semaphore>,
+    loopback: Arc<Semaphore>,
+    per_address: Arc<std::sync::Mutex<HashMap<IpAddr, usize>>>,
+}
+
+/// Holds a handshake slot; releases it (and the per-address count) on drop.
+struct HandshakePermit {
+    _slot: OwnedSemaphorePermit,
+    address: Option<(IpAddr, Arc<std::sync::Mutex<HashMap<IpAddr, usize>>>)>,
+}
+
+impl Drop for HandshakePermit {
+    fn drop(&mut self) {
+        if let Some((ip, map)) = self.address.take() {
+            let mut map = map.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(n) = map.get_mut(&ip) {
+                *n -= 1;
+                if *n == 0 {
+                    map.remove(&ip);
+                }
+            }
+        }
+    }
+}
+
+impl HandshakeLimits {
+    fn new() -> Self {
+        Self {
+            network: Arc::new(Semaphore::new(MAX_PENDING_HANDSHAKES)),
+            loopback: Arc::new(Semaphore::new(MAX_PENDING_LOOPBACK)),
+            per_address: Arc::default(),
+        }
+    }
+
+    fn admit(&self, ip: IpAddr) -> Option<HandshakePermit> {
+        if ip.is_loopback() {
+            let slot = self.loopback.clone().try_acquire_owned().ok()?;
+            return Some(HandshakePermit { _slot: slot, address: None });
+        }
+        let mut map = self.per_address.lock().unwrap_or_else(|e| e.into_inner());
+        if map.get(&ip).copied().unwrap_or(0) >= MAX_PENDING_PER_ADDRESS {
+            return None;
+        }
+        let slot = self.network.clone().try_acquire_owned().ok()?;
+        *map.entry(ip).or_insert(0) += 1;
+        Some(HandshakePermit { _slot: slot, address: Some((ip, self.per_address.clone())) })
     }
 }
 
@@ -643,6 +707,33 @@ async fn send_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_lan_address_cannot_take_every_handshake_slot() {
+        let limits = HandshakeLimits::new();
+        let attacker: IpAddr = "192.168.1.66".parse().unwrap();
+        let held: Vec<_> = (0..MAX_PENDING_PER_ADDRESS).map(|_| limits.admit(attacker).expect("first slots")).collect();
+        assert!(limits.admit(attacker).is_none(), "per-address cap");
+        // Another device on the network and the USB cable still get in.
+        assert!(limits.admit("192.168.1.20".parse().unwrap()).is_some());
+        assert!(limits.admit("127.0.0.1".parse().unwrap()).is_some());
+        drop(held);
+        assert!(limits.admit(attacker).is_some(), "slots are returned when a handshake ends");
+    }
+
+    #[test]
+    fn a_lan_flood_never_blocks_usb() {
+        let limits = HandshakeLimits::new();
+        let flood: Vec<_> = (0..64u8)
+            .filter_map(|i| limits.admit(IpAddr::from([10, 0, i / 2, i])))
+            .collect();
+        assert_eq!(flood.len(), MAX_PENDING_HANDSHAKES, "network slots are bounded");
+        assert!(limits.admit("10.9.9.9".parse().unwrap()).is_none());
+        let usb: Vec<_> = (0..MAX_PENDING_LOOPBACK).map(|_| limits.admit("127.0.0.1".parse().unwrap())).collect();
+        assert!(usb.iter().all(Option::is_some), "loopback has its own slots");
+        drop(flood);
+        assert!(limits.per_address.lock().unwrap().is_empty(), "no per-address entries leak");
+    }
 
     #[tokio::test]
     async fn loopback_sockets_get_the_small_send_buffer() {

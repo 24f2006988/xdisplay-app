@@ -117,6 +117,10 @@ pub struct PacketInfo {
     pub first_slice: Option<usize>,
 }
 
+/// Inspection stops at the first slice: parameter sets come before the slices of an access unit,
+/// and every slice of a picture has the same IDR-ness, so nothing after it changes the result.
+/// (Scanning the whole frame cost about 0.36 us per KB, on the PC and again on the tablet, for
+/// every frame.)
 pub fn inspect_h264(data: &[u8]) -> PacketInfo {
     let mut info = PacketInfo::default();
     for nal in nal_units_h264(data) {
@@ -131,10 +135,15 @@ pub fn inspect_h264(data: &[u8]) -> PacketInfo {
             }
             _ => {}
         }
+        // Do not pull the next NAL: finding it would scan the rest of the frame.
+        if info.first_slice.is_some() {
+            break;
+        }
     }
     info
 }
 
+/// See [`inspect_h264`]: stops at the first slice.
 pub fn inspect_hevc(data: &[u8]) -> PacketInfo {
     let mut info = PacketInfo::default();
     for nal in nal_units_hevc(data) {
@@ -150,6 +159,10 @@ pub fn inspect_hevc(data: &[u8]) -> PacketInfo {
                 info.first_slice.get_or_insert(nal.start);
             }
             _ => {}
+        }
+        // Do not pull the next NAL: finding it would scan the rest of the frame.
+        if info.first_slice.is_some() {
+            break;
         }
     }
     info
@@ -264,6 +277,31 @@ mod tests {
         let codec_info = inspect_for_codec(&pkt, VideoCodec::Hevc);
         assert!(codec_info.has_config && codec_info.has_idr);
         assert_eq!(codec_info.first_slice, Some(20));
+    }
+
+    #[test]
+    fn inspection_stops_at_the_first_slice_with_the_same_result() {
+        // IDR picture in two slices with a large body: same answer as a full scan, and the
+        // config split point is unchanged.
+        let mut pkt = vec![0, 0, 0, 1, 0x40, 1, 0x0c, 0, 0, 0, 1, 0x42, 1, 1, 0, 0, 0, 1, 0x44, 2, 0, 0, 0, 1, 0x26, 1];
+        pkt.extend(std::iter::repeat_n(0x55u8, 100_000));
+        pkt.extend_from_slice(&[0, 0, 0, 1, 0x26, 1, 7, 7]); // second slice of the same IDR
+        let info = inspect_hevc(&pkt);
+        assert!(info.has_config && info.has_idr);
+        assert_eq!(info.first_slice, Some(20));
+
+        let mut p = vec![0, 0, 0, 1, 0x46, 1, 0x50, 0, 0, 0, 1, 0x02, 1];
+        p.extend(std::iter::repeat_n(0x33u8, 100_000));
+        let info = inspect_hevc(&p);
+        assert!(!info.has_config && !info.has_idr);
+        assert_eq!(info.first_slice, Some(7));
+
+        let mut h = vec![0, 0, 0, 1, 0x09, 0x10, 0, 0, 0, 1, 0x67, 1, 0, 0, 0, 1, 0x68, 3, 0, 0, 0, 1, 0x65, 9];
+        h.extend(std::iter::repeat_n(0x77u8, 50_000));
+        h.extend_from_slice(&[0, 0, 0, 1, 0x65, 1]);
+        let info = inspect_h264(&h);
+        assert!(info.has_config && info.has_idr);
+        assert_eq!(info.first_slice, Some(18));
     }
 
     #[test]

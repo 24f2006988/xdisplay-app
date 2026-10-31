@@ -19,8 +19,30 @@ if (-not (Test-Path $targetDir)) {
     New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
 }
 $bundledXml = Join-Path (Split-Path -Parent $PSCommandPath) "vdd_settings.xml"
+$destXml = Join-Path $targetDir "vdd_settings.xml"
+$xmlChanged = $false
 if (Test-Path $bundledXml) {
-    Copy-Item -Path $bundledXml -Destination (Join-Path $targetDir "vdd_settings.xml") -Force -ErrorAction SilentlyContinue
+    $srcHash = (Get-FileHash -Path $bundledXml -Algorithm SHA256).Hash
+    $dstHash = if (Test-Path $destXml) { (Get-FileHash -Path $destXml -Algorithm SHA256 -ErrorAction SilentlyContinue).Hash } else { "" }
+    if ($srcHash -ne $dstHash) {
+        Copy-Item -Path $bundledXml -Destination $destXml -Force -ErrorAction SilentlyContinue
+        $xmlChanged = $true
+    }
+}
+
+function Invoke-VddPipeReload {
+    try {
+        $pipe = New-Object System.IO.Pipes.NamedPipeClientStream(".", "MTTVirtualDisplayPipe", [System.IO.Pipes.PipeDirection]::InOut)
+        $pipe.Connect(1500)
+        $bytes = [System.Text.Encoding]::Unicode.GetBytes("RELOAD_DRIVER" + [char]0)
+        $pipe.Write($bytes, 0, $bytes.Length)
+        $pipe.Flush()
+        $pipe.Dispose()
+        Start-Sleep -Milliseconds 400
+        return $true
+    } catch {
+        return $false
+    }
 }
 
 # 2. Configure VDDPATH in HKLM registry so MttVDD loads our optimized 3:2 tablet resolutions
@@ -43,8 +65,14 @@ try {
 
 # 3. Check device state
 $vdd = Get-PnpDevice -InstanceId "ROOT\DISPLAY\0000" -ErrorAction SilentlyContinue
+$vddMonitor = Get-PnpDevice -Class "Monitor" -ErrorAction SilentlyContinue | Where-Object { $_.FriendlyName -like "*VDD*" -and $_.Status -eq "OK" }
 
 if ($vdd -and $vdd.Status -eq "OK" -and -not $needsRestart) {
+    if ($xmlChanged -or -not $vddMonitor) {
+        if (Invoke-VddPipeReload) {
+            Write-Host " [OK] Reloaded Virtual Display Driver settings via pipe." -ForegroundColor Green
+        }
+    }
     Write-Host " [OK] Virtual Display Driver is active and configured." -ForegroundColor Green
 } else {
     Write-Host " [*] Enabling/Restarting Virtual Display Driver to apply display modes..." -ForegroundColor Yellow

@@ -5,7 +5,8 @@
 ;   - xdisplay-host.exe (dashboard + tray app that streams to the phone/tablet)
 ;   - the virtual display driver (MttVDD, MIT licensed) that gives Windows a real second monitor
 ;   - Windows Firewall rules for Wi-Fi (local network only, optional)
-;   - UsbDk (Red Hat, Apache-2.0) for plug-and-play USB without USB debugging
+;   - (1.0.1) no longer installs UsbDk, and offers to remove the copy 1.0.0 installed: it is a
+;     filter on every USB stack and blue-screened Windows (0x10D) when a device was unplugged
 ;   - the Android app (APK) for copying to a device
 ;
 ; Build: scripts\build_release.ps1 (or ISCC.exe installer\xdisplay_setup.iss after building
@@ -14,7 +15,7 @@
 
 #define MyAppName "XDisplay"
 #ifndef MyAppVersion
-  #define MyAppVersion "1.0.0"
+  #define MyAppVersion "1.0.1"
 #endif
 #define MyAppPublisher "XDisplay contributors"
 #define MyAppURL "https://github.com/24f2006988/xdisplay-app"
@@ -58,7 +59,7 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 Name: "autostart"; Description: "Start XDisplay in the tray when I sign in to Windows"; GroupDescription: "Startup:"; Flags: unchecked
 Name: "firewall"; Description: "Allow phones and tablets on my Wi-Fi to connect (Windows Firewall: TCP 59100 and UDP 59101, local network only)"; GroupDescription: "Wi-Fi:"; Flags: checkedonce
-Name: "usbdk"; Description: "Install the plug-and-play USB driver (UsbDk), so USB works without USB debugging (needs a restart)"; GroupDescription: "USB:"; Flags: checkedonce
+Name: "removeusbdk"; Description: "Remove the UsbDk USB driver that XDisplay 1.0.0 installed (recommended: it can crash Windows when a USB device is unplugged; needs a restart)"; GroupDescription: "USB:"; Check: UsbDkInstalledByMsi
 
 [Files]
 Source: "..\target\release\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
@@ -68,9 +69,6 @@ Source: "..\driver\vdd_settings.xml"; DestDir: "{#VddDir}"; Flags: ignoreversion
 ; Wi-Fi helpers (firewall rules, connection troubleshooter)
 Source: "..\scripts\setup_wifi_firewall.ps1"; DestDir: "{app}\scripts"; Flags: ignoreversion
 Source: "..\scripts\try_wifi.ps1"; DestDir: "{app}\scripts"; Flags: ignoreversion
-; UsbDk (Red Hat, signed)
-Source: "redist\UsbDk_1.0.22_x64.msi"; DestDir: "{tmp}"; Flags: deleteafterinstall; Tasks: usbdk
-Source: "redist\UsbDk-LICENSE.txt"; DestDir: "{app}\licenses"; DestName: "UsbDk-Apache-2.0.txt"; Flags: ignoreversion
 ; Android app, for copying to a phone or tablet
 Source: "..\dist\XDisplay-{#MyAppVersion}.apk"; DestDir: "{app}\android"; DestName: "XDisplay.apk"; Flags: ignoreversion
 Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
@@ -101,9 +99,6 @@ Filename: "netsh.exe"; Parameters: "advfirewall firewall delete rule name=""XDis
 Filename: "netsh.exe"; Parameters: "advfirewall firewall delete rule name=""XDisplay Host (Wi-Fi discovery, UDP 59101)"""; Flags: runhidden; Tasks: firewall
 Filename: "netsh.exe"; Parameters: "advfirewall firewall add rule name=""XDisplay Host (Wi-Fi stream, TCP 59100)"" dir=in action=allow protocol=TCP localport=59100 profile=private,domain remoteip=localsubnet"; Flags: runhidden; Tasks: firewall; StatusMsg: "Configuring Windows Firewall for Wi-Fi..."
 Filename: "netsh.exe"; Parameters: "advfirewall firewall add rule name=""XDisplay Host (Wi-Fi discovery, UDP 59101)"" dir=in action=allow protocol=UDP localport=59101 profile=private,domain remoteip=localsubnet"; Flags: runhidden; Tasks: firewall
-; Plug-and-play USB (Android Open Accessory over UsbDk). Left installed on uninstall: other
-; software may share it.
-Filename: "msiexec.exe"; Parameters: "/i ""{tmp}\UsbDk_1.0.22_x64.msi"" /qn /norestart"; Flags: runhidden; Tasks: usbdk; StatusMsg: "Installing the plug-and-play USB driver..."
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#MyAppName}}"; Flags: nowait postinstall skipifsilent runasoriginaluser
 
 [UninstallRun]
@@ -120,18 +115,55 @@ const
   StateKey = 'Software\XDisplay';
 
 var
-  UsbDkWasPresent: Boolean;
   DriverNeedsRestart: Boolean;
+  UsbDkRemoved: Boolean;
 
-function UsbDkPresent(): Boolean;
+// Product code of the installed "UsbDk Runtime Libraries" MSI, or '' when it is not installed.
+function UsbDkProductCode(): String;
+var
+  Keys: TArrayOfString;
+  I: Integer;
+  Name: String;
 begin
-  Result := RegKeyExists(HKLM, 'SYSTEM\CurrentControlSet\Services\UsbDk');
+  Result := '';
+  if RegGetSubkeyNames(HKLM, 'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall', Keys) then
+    for I := 0 to GetArrayLength(Keys) - 1 do
+      if RegQueryStringValue(HKLM, 'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\' + Keys[I], 'DisplayName', Name) then
+        if (Pos('UsbDk', Name) = 1) and (Copy(Keys[I], 1, 1) = '{') then
+        begin
+          Result := Keys[I];
+          Exit;
+        end;
+end;
+
+function UsbDkInstalledByMsi(): Boolean;
+begin
+  Result := UsbDkProductCode() <> '';
+end;
+
+// 1.0.0 installed UsbDk silently. It is a filter on every USB stack and bugchecked Windows
+// (0x10D WDF_VIOLATION) when a device was unplugged, so 1.0.1 offers to remove it.
+procedure RemoveUsbDk();
+var
+  Code: String;
+  ResultCode: Integer;
+begin
+  Code := UsbDkProductCode();
+  if Code = '' then
+    Exit;
+  WizardForm.StatusLabel.Caption := 'Removing the UsbDk USB driver...';
+  if Exec('msiexec.exe', '/x ' + Code + ' /qn /norestart', '', SW_HIDE, ewWaitUntilTerminated, ResultCode) and
+     ((ResultCode = 0) or (ResultCode = 3010) or (ResultCode = 1641)) then
+    UsbDkRemoved := True
+  else
+    SuppressibleMsgBox('The UsbDk driver could not be removed (code ' + IntToStr(ResultCode) + '). ' +
+      'Remove "UsbDk Runtime Libraries" in Settings > Apps, then restart Windows.', mbError, MB_OK, IDOK);
 end;
 
 function InitializeSetup(): Boolean;
 begin
-  UsbDkWasPresent := UsbDkPresent();
   DriverNeedsRestart := False;
+  UsbDkRemoved := False;
   Result := True;
 end;
 
@@ -187,13 +219,17 @@ end;
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssPostInstall then
+  begin
     InstallDisplayDriver();
+    if WizardIsTaskSelected('removeusbdk') then
+      RemoveUsbDk();
+  end;
 end;
 
 function NeedRestart(): Boolean;
 begin
-  // UsbDk attaches to the USB controllers only when they start.
-  Result := DriverNeedsRestart or ((not UsbDkWasPresent) and UsbDkPresent());
+  // A removed USB filter driver leaves the USB stacks only when they restart.
+  Result := DriverNeedsRestart or UsbDkRemoved;
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);

@@ -1,0 +1,4 @@
+# The tablet decrypts every Wi-Fi video byte. chacha20 0.9 only uses its NEON backend on aarch64
+# when asked to (otherwise it runs the portable code, roughly half the speed).
+[target.aarch64-linux-android]
+rustflags = ["--cfg", "chacha20_force_neon"]

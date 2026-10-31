@@ -149,6 +149,9 @@ async fn run() -> Result<()> {
     let mut injector = PointerInjector::new(disp.width, disp.height)?;
     injector.set_monitor_rect(disp.left, disp.top, disp.width, disp.height);
     let shared = Arc::new(HostShared::new(injector, disp));
+    // New tablets on USB are admitted only after the user says yes at the PC.
+    #[cfg(windows)]
+    shared.pairing.set_usb_approver(Arc::new(gui::usb_approval_prompt));
 
     // Bind before anything advertises the port (adb reverse, dashboard, Wi-Fi beacons).
     let server = TransportServer::bind(DEFAULT_PORT, shared.clone()).await?;

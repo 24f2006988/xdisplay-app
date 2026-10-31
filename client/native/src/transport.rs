@@ -110,6 +110,8 @@ const DEFAULT_STREAM_SIZE: (u32, u32) = (1800, 1200);
 /// (a vanished access point never sends a FIN).
 const LIVENESS_TIMEOUT_MS: u64 = 4000;
 const HANDSHAKE_READ_TIMEOUT: Duration = Duration::from_secs(5);
+/// Longer than the host's 60 s approval prompt for a new USB tablet.
+const USB_APPROVAL_READ_TIMEOUT: Duration = Duration::from_secs(75);
 
 /// Milliseconds on a monotonic clock, comparable across threads.
 fn mono_ms() -> u64 {
@@ -524,7 +526,9 @@ impl Link {
                 log::warn!("Could not set TCP_NODELAY: {}", e);
             }
             let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
-            let _ = stream.set_read_timeout(Some(HANDSHAKE_READ_TIMEOUT));
+            // Over USB a new tablet waits while the user answers the PC's approval prompt.
+            let read_timeout = if addr.ip().is_loopback() { USB_APPROVAL_READ_TIMEOUT } else { HANDSHAKE_READ_TIMEOUT };
+            let _ = stream.set_read_timeout(Some(read_timeout));
 
             log::info!("Connected to {}; authenticating...", addr_str);
             let hello = ClientHello {

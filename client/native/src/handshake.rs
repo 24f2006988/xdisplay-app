@@ -70,7 +70,10 @@ fn reject_error(reason: AuthRejectReason, host_name: &str) -> HandshakeError {
         AuthRejectReason::UnknownDevice => HandshakeError::NeedsPin { host_name: host_name.to_string() },
         AuthRejectReason::BadCredentials => HandshakeError::Rejected("Wrong PIN. Check the code shown on the PC.".into()),
         AuthRejectReason::Locked => HandshakeError::Rejected(
-            "Too many wrong PINs. The PC generated a new one; read the new code from its dashboard.".into(),
+            "Too many wrong PINs, so the PC paused pairing. Press New PIN on its dashboard, then enter the new code.".into(),
+        ),
+        AuthRejectReason::Denied => HandshakeError::Rejected(
+            "The PC did not allow this tablet. Connect again and choose Yes in the prompt on the PC.".into(),
         ),
     }
 }
@@ -86,8 +89,11 @@ pub fn client_handshake(
 ) -> Result<Established, HandshakeError> {
     let client_id = hello.client_id;
     write_control(stream, &ControlMessage::ClientHello(hello))?;
-    let ControlMessage::HelloAck(ack) = read_control(stream)? else {
-        return Err(io_err("host did not acknowledge the hello"));
+    // On USB the host may hold this read while the user answers its approval prompt.
+    let ack = match read_control(stream)? {
+        ControlMessage::HelloAck(ack) => ack,
+        ControlMessage::AuthReject(reason) => return Err(reject_error(reason, "the PC")),
+        _ => return Err(io_err("host did not acknowledge the hello")),
     };
 
     if ack.auth == AuthPolicy::Open {
@@ -95,7 +101,20 @@ pub fn client_handshake(
             // Only a loopback peer is ever offered this by a genuine host.
             return Err(HandshakeError::Rejected("The host offered an unauthenticated session over the network.".into()));
         }
+        // A genuine PC that issued us a secret always asks for it, on USB too. An Open offer
+        // under that PC's id is a downgrade (for example another app listening on the loopback
+        // port the tablet dials), so refuse it rather than hand that app our input.
+        if config.credentials.iter().any(|(id, _)| *id == ack.host_id) {
+            return Err(HandshakeError::Rejected(
+                "Something on this tablet posed as your PC without its pairing secret. Refusing to connect.".into(),
+            ));
+        }
         return Ok(Established { host_id: ack.host_id, host_name: ack.host_name, secure: None });
+    }
+
+    // Plaintext after the proof is only acceptable on the local cable, never over the network.
+    if ack.auth == AuthPolicy::UsbSecret && !loopback {
+        return Err(HandshakeError::Rejected("The host offered an unencrypted session over the network.".into()));
     }
 
     let pin = config.pin.as_deref().map(str::trim).filter(|p| !p.is_empty());
@@ -129,7 +148,9 @@ pub fn client_handshake(
         _ => return Err(io_err("unexpected reply to the confirmation")),
     }
 
-    Ok(Established { host_id: ack.host_id, host_name: ack.host_name, secure: Some(key.into_channel(Role::Client, &t)) })
+    // Both sides proved the secret. On USB the session stays plaintext (`AuthPolicy::UsbSecret`).
+    let secure = (ack.auth == AuthPolicy::PasswordRequired).then(|| key.into_channel(Role::Client, &t));
+    Ok(Established { host_id: ack.host_id, host_name: ack.host_name, secure })
 }
 
 #[cfg(test)]
@@ -175,6 +196,10 @@ mod tests {
 
     /// A minimal host: demands `password`, answers honestly unless `lie_in_proof` is set.
     fn fake_host(password: Vec<u8>, lie_in_proof: bool) -> (u16, thread::JoinHandle<()>) {
+        fake_host_with(password, lie_in_proof, AuthPolicy::PasswordRequired)
+    }
+
+    fn fake_host_with(password: Vec<u8>, lie_in_proof: bool, auth: AuthPolicy) -> (u16, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let handle = thread::spawn(move || {
@@ -182,7 +207,7 @@ mod tests {
             let ControlMessage::ClientHello(h) = read_control(&mut s).unwrap() else { panic!() };
             write_control(
                 &mut s,
-                &ControlMessage::HelloAck(HelloAck { host_id: HOST_ID, host_name: "FAKE".into(), auth: AuthPolicy::PasswordRequired }),
+                &ControlMessage::HelloAck(HelloAck { host_id: HOST_ID, host_name: "FAKE".into(), auth }),
             )
             .unwrap();
             // The client may stop here (no PIN available).
@@ -253,6 +278,61 @@ mod tests {
         let cfg = config(Some("482913"), vec![]);
         let err = client_handshake(&mut connect(port), &cfg, hello(), false).err().unwrap();
         assert!(matches!(err, HandshakeError::Rejected(_)), "{err:?}");
+        host.join().unwrap();
+    }
+
+    /// A host that answers the hello with `reply` and stops.
+    fn one_reply_host(reply: ControlMessage) -> (u16, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let host = thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            read_control(&mut s).unwrap();
+            write_control(&mut s, &reply).unwrap();
+        });
+        (port, host)
+    }
+
+    #[test]
+    fn usb_secret_proves_both_ways_and_stays_plaintext_only_on_loopback() {
+        let secret = [0xAB; 32];
+        let (port, host) = fake_host_with(secret.to_vec(), false, AuthPolicy::UsbSecret);
+        let cfg = config(None, vec![(HOST_ID, secret)]);
+        let est = client_handshake(&mut connect(port), &cfg, hello(), true).unwrap();
+        assert!(est.secure.is_none());
+        host.join().unwrap();
+
+        // Over the network the same offer is a downgrade.
+        let (port, host) = fake_host_with(secret.to_vec(), false, AuthPolicy::UsbSecret);
+        assert!(matches!(client_handshake(&mut connect(port), &cfg, hello(), false), Err(HandshakeError::Rejected(_))));
+        host.join().unwrap();
+
+        // A fake "PC" on the tablet's loopback cannot prove our secret.
+        let (port, host) = fake_host_with(b"not the secret".to_vec(), false, AuthPolicy::UsbSecret);
+        assert!(client_handshake(&mut connect(port), &cfg, hello(), true).is_err());
+        host.join().unwrap();
+    }
+
+    #[test]
+    fn a_pc_refusing_this_usb_tablet_is_a_permanent_rejection() {
+        let (port, host) = one_reply_host(ControlMessage::AuthReject(AuthRejectReason::Denied));
+        let err = client_handshake(&mut connect(port), &config(None, vec![]), hello(), true).err().unwrap();
+        assert!(matches!(err, HandshakeError::Rejected(ref m) if m.contains("did not allow")), "{err:?}");
+        host.join().unwrap();
+    }
+
+    #[test]
+    fn open_offer_from_a_pc_we_hold_a_secret_for_is_a_downgrade() {
+        let open = || ControlMessage::HelloAck(HelloAck { host_id: HOST_ID, host_name: "FAKE".into(), auth: AuthPolicy::Open });
+        let (port, host) = one_reply_host(open());
+        let cfg = config(None, vec![(HOST_ID, [0xAA; 32])]);
+        let err = client_handshake(&mut connect(port), &cfg, hello(), true).err().unwrap();
+        assert!(matches!(err, HandshakeError::Rejected(_)), "{err:?}");
+        host.join().unwrap();
+
+        // A PC we have never paired with may still admit us openly on USB (first approval).
+        let (port, host) = one_reply_host(open());
+        assert!(client_handshake(&mut connect(port), &config(None, vec![]), hello(), true).is_ok());
         host.join().unwrap();
     }
 

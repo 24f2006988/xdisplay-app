@@ -194,10 +194,18 @@ pub struct StreamSettingsUpdate {
 /// How the host wants the connection authenticated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AuthPolicy {
-    /// Loopback peer (USB / `adb reverse`): trusted, no encryption.
+    /// USB peer (adb or the accessory bridge) that the user just approved at the PC: plaintext,
+    /// and the host's first message is `PairingComplete` with this tablet's new secret. From
+    /// then on the same tablet gets `PasswordRequired` on USB too.
     Open,
     /// Network peer: SPAKE2 handshake required, session fully encrypted.
     PasswordRequired,
+    /// USB peer the user approved earlier: the same SPAKE2 proof of the device secret, but the
+    /// session then stays unencrypted. On the cable the threat is another app *connecting* (which
+    /// the proof stops), not someone reading the link, and skipping the cipher keeps USB at its
+    /// lowest latency. A tablet accepts this only when it dialled a loopback address.
+    /// Appended last so the earlier variants keep their wire encoding.
+    UsbSecret,
 }
 
 /// Host's answer to `ClientHello`; identifies the host so the tablet can pick the right secret.
@@ -224,6 +232,9 @@ pub enum AuthRejectReason {
     BadCredentials,
     /// Too many wrong PINs; the PIN was changed.
     Locked,
+    /// A new tablet on USB was not approved at the PC (the user said no, or nobody answered).
+    /// Appended last so the earlier variants keep their wire encoding.
+    Denied,
 }
 
 /// Small control messages exchanged across the link (serialized with bincode).
