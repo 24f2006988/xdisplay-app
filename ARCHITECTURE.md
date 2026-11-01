@@ -67,7 +67,7 @@ device draws a short-lived local ink trail under the pen so strokes feel immedia
 
 | Link | How it works | Authentication |
 |---|---|---|
-| USB accessory (USB debugging on) | The host uses WinUSB to switch the device into Android Open Accessory mode and bridges the USB bulk endpoints to its local TCP server, in-process (`host/src/transport/aoa.rs`, `AoaBridge.kt`). UsbDk (USB debugging off) was removed in 1.0.1: it crashed Windows on unplug. | New device: the user approves it at the PC, then it gets a device secret. Known device: proves its secret (SPAKE2), and the session is unencrypted on the cable |
+| USB accessory (USB debugging on, or off after USB setup) | The host uses WinUSB to switch the device into Android Open Accessory mode and bridges the USB bulk endpoints to its local TCP server, in-process (`host/src/transport/aoa.rs`, `AoaBridge.kt`). With debugging off, `XDisplay-USB-Setup.cmd` (`scripts/usb_setup.ps1`) binds Microsoft's inbox WinUSB driver once per device to its MTP interface and its accessory device (no filter driver; undone with `-Undo` or on uninstall). UsbDk was removed in 1.0.1: it crashed Windows on unplug. | New device: the user approves it at the PC, then it gets a device secret. Known device: proves its secret (SPAKE2), and the session is unencrypted on the cable |
 | USB with adb | `adb reverse tcp:59100 tcp:59100`; the host re-applies it whenever a device is attached. | Same as above; the local peer must be adb run by the same Windows user |
 | Wi-Fi / LAN | The device finds PCs by UDP broadcast on port 59101, then connects over TCP 59100. | One-time 6-digit PIN pairing (SPAKE2), then every packet encrypted and authenticated with ChaCha20-Poly1305 |
 

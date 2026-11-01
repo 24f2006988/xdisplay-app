@@ -845,7 +845,7 @@ dependencies = [
 
 [[package]]
 name = "xdisplay-client-native"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "android_logger",
  "anyhow",
@@ -863,7 +863,7 @@ dependencies = [
 
 [[package]]
 name = "xdisplay-common"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "bincode",
  "bytemuck",

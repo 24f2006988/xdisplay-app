@@ -1,6 +1,6 @@
 [package]
 name = "xdisplay-host"
-version = "1.0.1"
+version = "1.0.2"
 edition = "2021"
 license = "GPL-3.0-or-later"
 description = "XDisplay Windows host: streams a virtual monitor to an Android tablet and injects its pen and touch input"

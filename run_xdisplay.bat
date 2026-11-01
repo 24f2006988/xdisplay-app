@@ -96,7 +96,7 @@ if not exist "%HOST_EXE%" (
     echo Release binary not found. Compiling release build now...
     cd /d "%REPO_ROOT%"
     cargo build --release -p xdisplay-host
-    if %ERRORLEVEL% neq 0 (
+    if !ERRORLEVEL! neq 0 (
         echo [ERROR] Failed to compile xdisplay-host!
         pause
         exit /b 1
@@ -105,7 +105,7 @@ if not exist "%HOST_EXE%" (
 
 echo.
 echo =====================================================================
-echo   XDisplay is running!
+echo   XDisplay is running^^!
 echo   - GUI Dashboard: check system tray icon or taskbar window
 echo   - To stop: press Ctrl+C in this console or Exit from the tray menu
 echo =====================================================================

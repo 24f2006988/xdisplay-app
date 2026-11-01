@@ -7,6 +7,8 @@
 ;   - Windows Firewall rules for Wi-Fi (local network only, optional)
 ;   - (1.0.1) no longer installs UsbDk, and offers to remove the copy 1.0.0 installed: it is a
 ;     filter on every USB stack and blue-screened Windows (0x10D) when a device was unplugged
+;   - USB setup (XDisplay-USB-Setup.cmd): one-time, per device, binds Windows' own WinUSB driver
+;     so USB works with USB debugging off; no filter driver; undone on uninstall
 ;   - the Android app (APK) for copying to a device
 ;
 ; Build: scripts\build_release.ps1 (or ISCC.exe installer\xdisplay_setup.iss after building
@@ -15,7 +17,7 @@
 
 #define MyAppName "XDisplay"
 #ifndef MyAppVersion
-  #define MyAppVersion "1.0.1"
+  #define MyAppVersion "1.0.2"
 #endif
 #define MyAppPublisher "XDisplay contributors"
 #define MyAppURL "https://github.com/24f2006988/xdisplay-app"
@@ -69,6 +71,9 @@ Source: "..\driver\vdd_settings.xml"; DestDir: "{#VddDir}"; Flags: ignoreversion
 ; Wi-Fi helpers (firewall rules, connection troubleshooter)
 Source: "..\scripts\setup_wifi_firewall.ps1"; DestDir: "{app}\scripts"; Flags: ignoreversion
 Source: "..\scripts\try_wifi.ps1"; DestDir: "{app}\scripts"; Flags: ignoreversion
+; USB without USB debugging: binds Windows' own WinUSB driver to the user's device (run once)
+Source: "..\scripts\usb_setup.ps1"; DestDir: "{app}\scripts"; Flags: ignoreversion
+Source: "..\XDisplay-USB-Setup.cmd"; DestDir: "{app}"; Flags: ignoreversion
 ; Android app, for copying to a phone or tablet
 Source: "..\dist\XDisplay-{#MyAppVersion}.apk"; DestDir: "{app}\android"; DestName: "XDisplay.apk"; Flags: ignoreversion
 Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
@@ -77,6 +82,8 @@ Source: "..\LICENSE"; DestDir: "{app}"; DestName: "LICENSE.txt"; Flags: ignoreve
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
 Name: "{group}\Wi-Fi troubleshooter"; Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -NoExit -File ""{app}\scripts\try_wifi.ps1"""
+Name: "{group}\USB setup (no USB debugging)"; Filename: "{app}\XDisplay-USB-Setup.cmd"; WorkingDir: "{app}"; Comment: "Plug in your device, then run this once"
+Name: "{group}\Undo USB setup"; Filename: "{app}\XDisplay-USB-Setup.cmd"; Parameters: "-Undo"; WorkingDir: "{app}"
 Name: "{group}\Android app (APK)"; Filename: "{app}\android"
 Name: "{group}\Log files"; Filename: "{localappdata}\XDisplay\logs"
 Name: "{group}\{cm:UninstallProgram,{#MyAppName}}"; Filename: "{uninstallexe}"
@@ -241,6 +248,11 @@ begin
   begin
     if RegQueryDWordValue(HKLM, StateKey, 'CreatedDisplayDevice', Created) and (Created = 1) then
       Exec(ExpandConstant('{app}\{#MyAppExeName}'), '--uninstall-display-driver', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    // Give devices bound by "USB setup" their normal (file-transfer) driver back. Its records
+    // live under StateKey, so this must run before the key is deleted.
+    if RegKeyExists(HKLM, StateKey + '\UsbBindings') then
+      Exec('powershell.exe', '-NoProfile -ExecutionPolicy Bypass -File "' + ExpandConstant('{app}\scripts\usb_setup.ps1') + '" -Undo -Quiet',
+        '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
     RegDeleteKeyIncludingSubkeys(HKLM, StateKey);
   end;
 end;

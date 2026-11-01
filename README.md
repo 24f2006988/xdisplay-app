@@ -22,10 +22,10 @@ tilt.
 
 - **A real second monitor.** A virtual display driver gives Windows an extra screen sized to your
   device's panel (1:1 pixels when the resolution is known, 60 to 144 Hz).
-- **USB.** Turn on USB debugging on the device and plug in the cable. The first time, the PC asks
-  whether to allow the device; after that it reconnects by itself. (Version 1.0.0 also worked with
-  USB debugging off through the UsbDk driver; that was removed in 1.0.1 because UsbDk could crash
-  Windows when the cable was unplugged.)
+- **USB, no USB debugging needed.** Run **USB setup** once with the device plugged in; after that
+  you just plug it in. It binds Windows' own WinUSB driver to that one device (no extra driver, no
+  filter driver). With USB debugging on it works without the setup too. The first time, the PC
+  asks whether to allow the device; after that it reconnects by itself.
 - **Wi-Fi.** PCs on the network show up on the device automatically. Pair once with a 6-digit PIN;
   after that the connection is encrypted and reconnects by itself.
 - **Pen and touch.** Pressure curves, tilt, hover, barrel button as right-click or eraser, palm
@@ -55,10 +55,17 @@ tilt.
 3. Start **XDisplay** on the PC (Start menu). It runs in the system tray; click the tray icon for
    the dashboard.
 4. Connect:
-   - **USB:** turn on **USB debugging** (Settings > Developer options), plug the device in, and
-     allow the computer on the device if asked. The first time, choose **Yes** in the "allow new
-     USB tablet?" prompt on the PC. If the device asks "Open XDisplay for this USB accessory?",
-     tap **OK** (tick "always").
+   - **USB (once per device):** plug the device in and set its USB mode to **File transfer**
+     (pull down the "Charging this device via USB" notification). Run **USB setup (no USB
+     debugging)** from the Start menu (or `XDisplay-USB-Setup.cmd`) and choose **Yes**. On the
+     device tap **OK** on "Open XDisplay for this USB accessory?" (tick "always"), and on the PC
+     choose **Yes** in the "allow new USB tablet?" prompt. From then on, just plug it in.
+
+     While set up, Windows cannot browse that device's files over USB. **Undo USB setup** in the
+     Start menu (or uninstalling XDisplay) gives it back its normal driver.
+
+     Alternatively turn on **USB debugging** (Settings > Developer options) instead of running the
+     setup; XDisplay then works over adb.
    - **Wi-Fi:** open XDisplay on the device, tap your PC under **PCs on this Wi-Fi** (or type the
      PC's IP address), and enter the PIN shown on the PC's dashboard. You only do this once.
 
@@ -79,7 +86,8 @@ drag it to where it sits next to your main screen.
 | Problem | Fix |
 |---|---|
 | The device does not list the PC | Same Wi-Fi on both, and Windows must treat the network as **Private** (Settings > Network & internet > Wi-Fi > your network). Run **Wi-Fi troubleshooter** from the Start menu. You can also type the PC's IPv4 address. |
-| USB does nothing when plugged in | Restart Windows once after installing (the USB driver attaches at boot). Try another cable/port. Alternatively enable USB debugging on the device and install [Android platform tools](https://developer.android.com/tools/releases/platform-tools) (`winget install Google.PlatformTools`, or put `adb.exe` on PATH); XDisplay then uses adb automatically. |
+| USB does nothing when plugged in | Run **USB setup (no USB debugging)** from the Start menu once, with the device plugged in and set to **File transfer**. Make sure XDisplay is running on the PC and installed on the device. Try another cable/port. Alternatively enable USB debugging on the device and install [Android platform tools](https://developer.android.com/tools/releases/platform-tools) (`winget install Google.PlatformTools`, or put `adb.exe` on PATH); XDisplay then uses adb automatically. |
+| Windows no longer shows the device's files | That is the USB setup. Run **Undo USB setup** from the Start menu, then replug the device. |
 | No second monitor appears, the main screen is mirrored instead | The virtual display driver is missing: run the installer again. |
 | Wrong or lost PIN | Dashboard > **Wi-Fi & Pairing** > **New PIN**. |
 | Picture is blurry or stutters on Wi-Fi | Use 5 GHz Wi-Fi close to the router, leave bitrate on **Auto**, or use USB. |

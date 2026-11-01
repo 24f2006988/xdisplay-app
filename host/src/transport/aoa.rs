@@ -12,6 +12,10 @@
 //! tablet whose MTP driver failed at boot come back as "USB device not recognized" (code 43).
 //! It is therefore used only when `XDISPLAY_ENABLE_USBDK=1` is set, and 1.0.1+ installers no
 //! longer install it.
+//!
+//! The supported debugging-off path is `scripts/usb_setup.ps1` (XDisplay-USB-Setup.cmd): it binds
+//! Microsoft's inbox WinUSB driver to the device's MTP interface and to its accessory device, per
+//! device instance, so the plain WinUSB backend below reaches both. No filter driver is involved.
 
 use crate::shared::HostShared;
 use rusb::{Context, Device, DeviceHandle, Direction, TransferType, UsbContext, UsbOption};
@@ -320,7 +324,8 @@ fn run_manager(winusb: Context, shared: Arc<HostShared>) {
                 ),
                 (Err(e), false) if attempts.tries > 1 => info!(
                     "{vid:04X}:{pid:04X} did not switch to accessory mode after {} tries ({e}). With USB \
-                     debugging off this needs the tablet's adb interface; enable USB debugging or use Wi-Fi",
+                     debugging off, run XDisplay-USB-Setup once (Start menu: USB setup) so Windows lets \
+                     XDisplay reach the device; or enable USB debugging, or use Wi-Fi",
                     attempts.tries
                 ),
                 (Err(e), false) => debug!("{vid:04X}:{pid:04X} cannot use accessory mode: {e}"),
@@ -359,7 +364,13 @@ fn request_accessory_mode_via_usbdk(vid: u16, pid: u16, abort: impl Fn() -> bool
 /// as an accessory. `abort` is checked again right before START: opening the device can take
 /// a few hundred ms, in which the tablet may have connected over adb.
 fn request_accessory_mode(device: &Device<Context>, abort: impl Fn() -> bool) -> rusb::Result<u16> {
-    let handle = device.open()?;
+    // On Windows, open() reports NotSupported while the device has no WinUSB driver (still on
+    // MTP, or mid-rebind by usb_setup.ps1). That must stay retryable: only the device's own
+    // answer to GET_PROTOCOL below means "cannot do AOA".
+    let handle = device.open().map_err(|e| match e {
+        rusb::Error::NotSupported => rusb::Error::NotFound,
+        e => e,
+    })?;
     let vendor_in = rusb::request_type(Direction::In, rusb::RequestType::Vendor, rusb::Recipient::Device);
     let vendor_out = rusb::request_type(Direction::Out, rusb::RequestType::Vendor, rusb::Recipient::Device);
 
