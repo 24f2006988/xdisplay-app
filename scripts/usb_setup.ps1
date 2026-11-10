@@ -190,7 +190,7 @@ public static class XdUsb {
             SP_DRVINFO_DATA drv = new SP_DRVINFO_DATA();
             drv.cbSize = (uint)Marshal.SizeOf(typeof(SP_DRVINFO_DATA));
             if (!SetupDiEnumDriverInfoW(set, ref dev, SPDIT_CLASSDRIVER, i, ref drv)) break;
-            if (string.Equals(drv.Description, "WinUsb Device", StringComparison.OrdinalIgnoreCase)) {
+            if (drv.Description != null && drv.Description.IndexOf("WinUsb", StringComparison.OrdinalIgnoreCase) >= 0) {
                 found = drv;
                 return true;
             }
