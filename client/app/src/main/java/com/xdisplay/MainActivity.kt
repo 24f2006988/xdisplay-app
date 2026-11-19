@@ -52,12 +52,16 @@ class MainActivity : Activity(), SurfaceHolder.Callback, View.OnTouchListener, V
 
     private lateinit var store: ConnectionStore
     private var target: Target = Target.USB
+    private var targetHostId: String? = null
     private var pinUsed = ""
     private var wifiLock: WifiManager.WifiLock? = null
     private var lastBackPress = 0L
     private var leaving = false
     private var aoaBridge: AoaBridge? = null
     private var usbReceiver: BroadcastReceiver? = null
+    private var tetherRediscoveryActive = false
+    private var disconnectedSinceMs = 0L
+    private var lastTetherIfaceSpec: String? = null
 
     /**
      * Frame rate the host streams at and the panel is asked to run at: the panel's highest
@@ -136,10 +140,13 @@ class MainActivity : Activity(), SurfaceHolder.Callback, View.OnTouchListener, V
     private fun applyPressureCurve(rawPressure: Float): Float {
         if (rawPressure <= 0f) return 0f
         val clamped = rawPressure.coerceIn(0f, 1f)
+        if (currentPressureCurve == PressureCurve.LINEAR) return clamped
         return clamped.toDouble().pow(currentPressureCurve.gamma.toDouble()).toFloat()
     }
 
-    // Two-finger gesture state
+    // Two-finger gesture & overlay UI touch capture state
+    private var uiTouchConsumed = false
+    private var twoFingerScrollActive = false
     private var gestureActive = false
     private var gestureNeedsAnchor = false
     private var anchorSpan = 1f
@@ -155,32 +162,100 @@ class MainActivity : Activity(), SurfaceHolder.Callback, View.OnTouchListener, V
     private val statusUpdateRunnable = object : Runnable {
         override fun run() {
             if (::inkOverlayView.isInitialized) {
+                val prevStatus = inkOverlayView.linkStatus
                 val status = NativeEngine.getConnectionStatus()
                 inkOverlayView.linkStatus = status
                 inkOverlayView.packetsSent = NativeEngine.getSentPacketsCount()
                 inkOverlayView.rttUs = NativeEngine.getRoundTripLatencyUs()
-                inkOverlayView.invalidate()
+                if (status != prevStatus || inkOverlayView.showHud || status != NativeEngine.STATUS_CONNECTED) {
+                    inkOverlayView.invalidate()
+                }
                 persistNewCredential()
-                if (status == NativeEngine.STATUS_NEEDS_PIN || status == NativeEngine.STATUS_AUTH_FAILED ||
+                if (status == NativeEngine.STATUS_CONNECTED) {
+                    disconnectedSinceMs = 0L
+                    stopTetherRediscovery()
+                } else if (status == NativeEngine.STATUS_NEEDS_PIN || status == NativeEngine.STATUS_AUTH_FAILED ||
                     status == NativeEngine.STATUS_TAKEN_OVER) {
+                    stopTetherRediscovery()
                     returnToConnect(status)
                     return
+                } else if (target.isUsbTether && targetHostId != null) {
+                    maybeRediscoverUsbTetherHost()
                 }
             }
             handler.postDelayed(this, 250)
         }
     }
 
+    /**
+     * Android 11+ randomizes the USB tethering subnet whenever USB tethering is toggled off and on.
+     * If our USB-tethered link drops, probe active interfaces until the same PC (`targetHostId`)
+     * reappears on its new USB IP, then seamlessly reconnect.
+     */
+    private fun maybeRediscoverUsbTetherHost() {
+        val now = SystemClock.elapsedRealtime()
+        if (disconnectedSinceMs == 0L) {
+            disconnectedSinceMs = now
+            return
+        }
+        if (now - disconnectedSinceMs < TETHER_REDISCOVERY_DELAY_MS) return
+
+        val ifaces = NetworkUtils.activeInterfaces()
+        val spec = NetworkUtils.toNativeSpec(ifaces)
+        if (spec != lastTetherIfaceSpec) {
+            lastTetherIfaceSpec = spec
+            NativeEngine.setDiscoveryInterfaces(spec)
+        }
+        if (!tetherRediscoveryActive) {
+            tetherRediscoveryActive = true
+            NativeEngine.startDiscovery()
+        }
+        val expectedId = targetHostId ?: return
+        val snapshot = NativeEngine.getDiscoveredHosts()
+        for (line in snapshot.lineSequence()) {
+            val parts = line.split('|')
+            if (parts.size < 5) continue
+            val ip = parts[0]
+            val port = parts[1].toIntOrNull() ?: continue
+            val name = parts[2]
+            val hostId = parts[3]
+            val isUsb = parts[4] == "usb"
+            if (isUsb && hostId == expectedId && (ip != target.host || port != target.port)) {
+                Log.i("MainActivity", "USB Tethering PC moved to $ip:$port; reconnecting automatically")
+                target = Target(ip, port, name, isUsbTether = true)
+                store.lastTarget = target
+                inkOverlayView.targetLabel = target.label
+                disconnectedSinceMs = 0L
+                stopTetherRediscovery()
+                startNativeClient()
+                return
+            }
+        }
+    }
+
+    private fun stopTetherRediscovery() {
+        if (tetherRediscoveryActive) {
+            tetherRediscoveryActive = false
+            lastTetherIfaceSpec = null
+            NativeEngine.stopDiscovery()
+        }
+    }
+
     /** A completed pairing hands over the secret once; losing it would force re-pairing. */
     private fun persistNewCredential() {
         val credential = NativeEngine.takeNewCredential()
-        if (credential.isNotEmpty()) store.saveCredential(credential)
+        if (credential.isNotEmpty()) {
+            store.saveCredential(credential)
+            val id = credential.substringBefore(':', "")
+            if (id.isNotEmpty()) targetHostId = id
+        }
     }
 
     /** Goes back to the connection picker, explaining why when the PC refused us. */
     private fun returnToConnect(status: Int?) {
         if (leaving) return
         leaving = true
+        stopTetherRediscovery()
         aoaBridge?.close()
         aoaBridge = null
         val message = if (status != null) NativeEngine.getLastError() else null
@@ -196,15 +271,18 @@ class MainActivity : Activity(), SurfaceHolder.Callback, View.OnTouchListener, V
                 .putExtra(ConnectActivity.EXTRA_HOST, target.host)
                 .putExtra(ConnectActivity.EXTRA_PORT, target.port)
                 .putExtra(ConnectActivity.EXTRA_NAME, NativeEngine.getHostName().ifEmpty { target.name })
+                .putExtra(ConnectActivity.EXTRA_HOST_ID, targetHostId)
+                .putExtra(ConnectActivity.EXTRA_USB_TETHER, target.isUsbTether)
+                .putExtra(ConnectActivity.EXTRA_NO_AUTO_CONNECT, status == null)
         )
         finish()
     }
 
-    /** Wi-Fi power saving adds tens of milliseconds of jitter; hold the radio awake while streaming. */
+    /** Wi-Fi power saving adds tens of milliseconds of jitter; hold the radio awake while streaming over Wi-Fi. */
     @Suppress("DEPRECATION")
     private fun updateWifiLock() {
         releaseWifiLock()
-        if (target.isUsb) return
+        if (target.isUsb || target.isUsbTether) return
         val wifi = applicationContext.getSystemService(WIFI_SERVICE) as? WifiManager ?: return
         val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             WifiManager.WIFI_MODE_FULL_LOW_LATENCY
@@ -227,17 +305,6 @@ class MainActivity : Activity(), SurfaceHolder.Callback, View.OnTouchListener, V
      * example from `adb shell am start`, means USB, so the cable workflow is unchanged.
      */
     private fun connectFrom(intent: Intent) {
-        val usbManager = getSystemService(Context.USB_SERVICE) as? UsbManager
-        val accessory: UsbAccessory? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            intent.getParcelableExtra(UsbManager.EXTRA_ACCESSORY, UsbAccessory::class.java)
-        } else {
-            @Suppress("DEPRECATION")
-            intent.getParcelableExtra(UsbManager.EXTRA_ACCESSORY)
-        } ?: usbManager?.accessoryList?.firstOrNull()
-
-        aoaBridge?.close()
-        aoaBridge = null
-
         // A network target and PIN are accepted only from our own ConnectActivity: this activity
         // is exported, and another app must not be able to point it at a PC it controls.
         val internal = InternalIntents.isInternal(intent)
@@ -245,6 +312,22 @@ class MainActivity : Activity(), SurfaceHolder.Callback, View.OnTouchListener, V
             Log.w("MainActivity", "Ignoring connection extras from an external caller")
         }
         val host = if (internal) intent.getStringExtra(EXTRA_HOST) else null
+        val explicitNetworkHost = host != null && host != Target.USB_HOST
+
+        val usbManager = getSystemService(Context.USB_SERVICE) as? UsbManager
+        val explicitAccessory: UsbAccessory? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            intent.getParcelableExtra(UsbManager.EXTRA_ACCESSORY, UsbAccessory::class.java)
+        } else {
+            @Suppress("DEPRECATION")
+            intent.getParcelableExtra(UsbManager.EXTRA_ACCESSORY)
+        }
+        // Only fall back to an attached USB accessory when the user did not explicitly pick a Wi-Fi host.
+        val accessory: UsbAccessory? = explicitAccessory
+            ?: if (!explicitNetworkHost) usbManager?.accessoryList?.firstOrNull() else null
+
+        aoaBridge?.close()
+        aoaBridge = null
+
         target = if (accessory != null && usbManager != null) {
             try {
                 val bridge = AoaBridge(usbManager, accessory)
@@ -256,17 +339,29 @@ class MainActivity : Activity(), SurfaceHolder.Callback, View.OnTouchListener, V
                 Target.USB
             }
         } else if (host != null) {
-            Target(host, intent.getIntExtra(EXTRA_PORT, Target.DEFAULT_PORT), intent.getStringExtra(EXTRA_NAME) ?: host)
+            Target(
+                host,
+                intent.getIntExtra(EXTRA_PORT, Target.DEFAULT_PORT),
+                intent.getStringExtra(EXTRA_NAME) ?: host,
+                intent.getBooleanExtra(EXTRA_USB_TETHER, false)
+            )
         } else {
             Target.USB
         }
+        targetHostId = if (internal) intent.getStringExtra(EXTRA_HOST_ID) ?: store.lastHostId else null
         pinUsed = if (internal) intent.getStringExtra(EXTRA_PIN) ?: "" else ""
         leaving = false
+        disconnectedSinceMs = 0L
+        stopTetherRediscovery()
 
         inkOverlayView.targetLabel = target.label
         inkOverlayView.isUsbLink = target.isUsb
+        inkOverlayView.isUsbTetherLink = target.isUsbTether
         updateWifiLock()
+        startNativeClient()
+    }
 
+    private fun startNativeClient() {
         // The whole panel, not `displayMetrics`: that excludes the cutout/status area (3200x2006 on a
         // 3200x2136 panel), so the host would pick a virtual monitor with the wrong aspect ratio.
         val metrics = resources.displayMetrics
@@ -396,6 +491,8 @@ class MainActivity : Activity(), SurfaceHolder.Callback, View.OnTouchListener, V
             penOnlyMode = this@MainActivity.penOnlyMode
             onTogglePenOnly = {
                 this@MainActivity.penOnlyMode = !this@MainActivity.penOnlyMode
+                this@MainActivity.touchMode = if (this@MainActivity.penOnlyMode) TouchMode.PEN_ONLY else TouchMode.ALL_TOUCH
+                this@MainActivity.inkOverlayView.currentTouchMode = this@MainActivity.touchMode
                 this@MainActivity.penOnlyMode
             }
 
@@ -433,6 +530,14 @@ class MainActivity : Activity(), SurfaceHolder.Callback, View.OnTouchListener, V
             onApplyStreamSettings = { fps, bitrateKbps ->
                 this@MainActivity.currentFps = fps
                 this@MainActivity.currentBitrateKbps = bitrateKbps
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    val surf = surfaceView.holder.surface
+                    if (surf != null && surf.isValid) {
+                        runCatching {
+                            surf.setFrameRate(fps.toFloat(), android.view.Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE)
+                        }
+                    }
+                }
                 NativeEngine.updateStreamSettings(fps, bitrateKbps)
             }
         }
@@ -455,17 +560,25 @@ class MainActivity : Activity(), SurfaceHolder.Callback, View.OnTouchListener, V
     override fun onResume() {
         super.onResume()
         (getSystemService(DISPLAY_SERVICE) as DisplayManager).registerDisplayListener(displayListener, handler)
+        if (::inkOverlayView.isInitialized) {
+            inkOverlayView.setVsyncActive(true)
+        }
         handler.post(statusUpdateRunnable)
     }
 
     override fun onPause() {
         super.onPause()
         (getSystemService(DISPLAY_SERVICE) as DisplayManager).unregisterDisplayListener(displayListener)
+        if (::inkOverlayView.isInitialized) {
+            inkOverlayView.setVsyncActive(false)
+        }
         handler.removeCallbacks(statusUpdateRunnable)
+        stopTetherRediscovery()
         persistNewCredential()
     }
 
     override fun onDestroy() {
+        stopTetherRediscovery()
         usbReceiver?.let {
             try { unregisterReceiver(it) } catch (_: Exception) {}
             usbReceiver = null
@@ -595,6 +708,25 @@ class MainActivity : Activity(), SurfaceHolder.Callback, View.OnTouchListener, V
         }
     }
 
+    private fun cancelActiveFinger(event: MotionEvent, index: Int, width: Float, height: Float) {
+        val id = event.getPointerId(index)
+        val x = event.getX(index)
+        val y = event.getY(index)
+        inkOverlayView.processSample(id, MotionEvent.ACTION_CANCEL, MotionEvent.TOOL_TYPE_FINGER, x, y, 0f, 0f, 0f)
+        NativeEngine.sendPointerEvent(
+            pointerId = id,
+            action = 6, // actions::CANCEL
+            toolType = MotionEvent.TOOL_TYPE_FINGER,
+            normX = toNormX(x, width),
+            normY = toNormY(y, height),
+            pressure = 0f,
+            tiltX = 0f,
+            tiltY = 0f,
+            buttons = 0,
+            timestampUs = event.eventTime * 1000L
+        )
+    }
+
     /**
      * Consumes two-finger gestures for local zoom. Returns true when the event must not be
      * forwarded to Windows.
@@ -613,23 +745,10 @@ class MainActivity : Activity(), SurfaceHolder.Callback, View.OnTouchListener, V
 
             // The first finger's DOWN already reached Windows: cancel it so the gesture
             // does not turn into a click or drag on the desktop.
-            val first = if (event.actionIndex == 0) 1 else 0
-            val firstId = event.getPointerId(first)
-            val fx = event.getX(first)
-            val fy = event.getY(first)
-            inkOverlayView.processSample(firstId, MotionEvent.ACTION_CANCEL, MotionEvent.TOOL_TYPE_FINGER, fx, fy, 0f, 0f, 0f)
-            NativeEngine.sendPointerEvent(
-                pointerId = firstId,
-                action = 6, // actions::CANCEL
-                toolType = MotionEvent.TOOL_TYPE_FINGER,
-                normX = toNormX(fx, width),
-                normY = toNormY(fy, height),
-                pressure = 0f,
-                tiltX = 0f,
-                tiltY = 0f,
-                buttons = 0,
-                timestampUs = event.eventTime * 1000L
-            )
+            if (!penOnlyMode) {
+                val first = if (event.actionIndex == 0) 1 else 0
+                cancelActiveFinger(event, first, width, height)
+            }
 
             // Local ink is drawn in screen space; once the picture moves it no longer lines up.
             inkOverlayView.clearCanvas()
@@ -663,33 +782,62 @@ class MainActivity : Activity(), SurfaceHolder.Callback, View.OnTouchListener, V
         val height = v.height.toFloat()
         if (width <= 0f || height <= 0f) return false
 
+        val actionMasked = event.actionMasked
+
+        // Swallow the entire gesture once the overlay UI consumes ACTION_DOWN so trailing
+        // MOVE/UP events never leak through to Windows as phantom taps behind HUD buttons.
+        if (uiTouchConsumed) {
+            if (actionMasked == MotionEvent.ACTION_UP || actionMasked == MotionEvent.ACTION_CANCEL) {
+                uiTouchConsumed = false
+            }
+            return true
+        }
+
         // Check button clicks (Clear / Toggle HUD / Pinch mode / Minimap)
-        if (event.actionMasked == MotionEvent.ACTION_DOWN && !gestureActive) {
+        if (actionMasked == MotionEvent.ACTION_DOWN && !gestureActive && !twoFingerScrollActive) {
             if (inkOverlayView.handleButtonTouch(event.x, event.y)) {
+                uiTouchConsumed = true
                 return true
             }
         }
 
-        if (touchMode == TouchMode.TWO_FINGER_SCROLL && event.pointerCount >= 2) {
-            val yMid = (event.getY(0) + event.getY(1)) / 2f
-            when (event.actionMasked) {
-                MotionEvent.ACTION_POINTER_DOWN -> {
-                    scrollPrevY = yMid
+        if (touchMode == TouchMode.TWO_FINGER_SCROLL) {
+            if (!twoFingerScrollActive && actionMasked == MotionEvent.ACTION_POINTER_DOWN && event.pointerCount >= 2) {
+                val isTwoFingers = event.getToolType(0) == MotionEvent.TOOL_TYPE_FINGER &&
+                    event.getToolType(1) == MotionEvent.TOOL_TYPE_FINGER
+                if (isTwoFingers) {
+                    val first = if (event.actionIndex == 0) 1 else 0
+                    cancelActiveFinger(event, first, width, height)
+                    twoFingerScrollActive = true
+                    scrollPrevY = (event.getY(0) + event.getY(1)) / 2f
                     inkOverlayView.clearCanvas()
                     return true
                 }
-                MotionEvent.ACTION_MOVE -> {
-                    val deltaY = yMid - scrollPrevY
-                    if (abs(deltaY) >= 2f) {
-                        val scrollDelta = deltaY / 12f
-                        NativeEngine.sendScrollEvent(scrollDelta)
-                        scrollPrevY = yMid
+            }
+            if (twoFingerScrollActive) {
+                when (actionMasked) {
+                    MotionEvent.ACTION_POINTER_DOWN -> if (event.pointerCount >= 2) {
+                        scrollPrevY = (event.getY(0) + event.getY(1)) / 2f
                     }
-                    return true
+                    MotionEvent.ACTION_POINTER_UP -> {
+                        // Re-anchor on the remaining pair so lifting one of 3 fingers never jumps.
+                        val pair = twoPointerIndices(event, event.actionIndex)
+                        if (pair != null) {
+                            scrollPrevY = (event.getY(pair.first) + event.getY(pair.second)) / 2f
+                        }
+                    }
+                    MotionEvent.ACTION_MOVE -> if (event.pointerCount >= 2) {
+                        val xMid = (event.getX(0) + event.getX(1)) / 2f
+                        val yMid = (event.getY(0) + event.getY(1)) / 2f
+                        val deltaY = yMid - scrollPrevY
+                        if (abs(deltaY) >= 2f) {
+                            NativeEngine.sendScrollEventAt(toNormX(xMid, width), toNormY(yMid, height), deltaY / 12f)
+                            scrollPrevY = yMid
+                        }
+                    }
+                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> twoFingerScrollActive = false
                 }
-                MotionEvent.ACTION_POINTER_UP, MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                    return true
-                }
+                return true
             }
         }
 
@@ -699,6 +847,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback, View.OnTouchListener, V
 
         val historySize = event.historySize
         val pointerCount = event.pointerCount
+        var sentSample = false
 
         // 1. Process historical high-rate stylus / touch samples (120Hz - 240Hz digitizer pacing)
         for (h in 0 until historySize) {
@@ -708,63 +857,29 @@ class MainActivity : Activity(), SurfaceHolder.Callback, View.OnTouchListener, V
                 if (penOnlyMode && toolType == MotionEvent.TOOL_TYPE_FINGER) {
                     continue
                 }
-
-                val pointerId = event.getPointerId(p)
-                val hx = event.getHistoricalX(p, h)
-                val hy = event.getHistoricalY(p, h)
-                val rawPressure = event.getHistoricalPressure(p, h)
                 val tiltRad = event.getHistoricalAxisValue(MotionEvent.AXIS_TILT, p, h)
                 val orientRad = event.getHistoricalAxisValue(MotionEvent.AXIS_ORIENTATION, p, h)
-                val tiltDeg = Math.toDegrees(tiltRad.toDouble()).toFloat()
-                val tiltX = (-Math.sin(orientRad.toDouble()) * tiltDeg).toFloat()
-                val tiltY = (Math.cos(orientRad.toDouble()) * tiltDeg).toFloat()
-
-                var effectiveToolType = toolType
-                var effectiveButtons = event.buttonState
-                val hasBarrel = (event.buttonState and (MotionEvent.BUTTON_STYLUS_PRIMARY or MotionEvent.BUTTON_SECONDARY)) != 0
-                if (hasBarrel) {
-                    when (barrelMapping) {
-                        BarrelButtonMapping.RIGHT_CLICK -> effectiveButtons = 0x02
-                        BarrelButtonMapping.ERASER -> effectiveToolType = MotionEvent.TOOL_TYPE_ERASER
-                    }
-                }
-
-                val pressure = if (effectiveToolType == MotionEvent.TOOL_TYPE_STYLUS) {
-                    applyPressureCurve(rawPressure)
-                } else {
-                    rawPressure
-                }
-
-                // Instant local ink rendering
-                inkOverlayView.processSample(
-                    pointerId = pointerId,
-                    action = MotionEvent.ACTION_MOVE,
-                    toolType = effectiveToolType,
-                    x = hx,
-                    y = hy,
-                    pressure = pressure,
-                    tiltX = tiltX,
-                    tiltY = tiltY
+                forwardPointerSample(
+                    pointerId = event.getPointerId(p),
+                    overlayAction = MotionEvent.ACTION_MOVE,
+                    nativeAction = 1, // actions::MOVE
+                    toolType = toolType,
+                    buttonState = event.buttonState,
+                    x = event.getHistoricalX(p, h),
+                    y = event.getHistoricalY(p, h),
+                    rawPressure = event.getHistoricalPressure(p, h),
+                    tiltRad = tiltRad,
+                    orientRad = orientRad,
+                    width = width,
+                    height = height,
+                    timestampUs = histTimeUs,
+                    invalidateNow = false
                 )
-
-                // High-speed USB packet stream to Windows
-                NativeEngine.sendPointerEvent(
-                    pointerId = pointerId,
-                    action = 1, // actions::MOVE
-                    toolType = effectiveToolType,
-                    normX = toNormX(hx, width),
-                    normY = toNormY(hy, height),
-                    pressure = pressure,
-                    tiltX = tiltX,
-                    tiltY = tiltY,
-                    buttons = effectiveButtons,
-                    timestampUs = histTimeUs
-                )
+                sentSample = true
             }
         }
 
         // 2. Process current sample
-        val actionMasked = event.actionMasked
         val actionIndex = event.actionIndex
         val action = when (actionMasked) {
             MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> 0 // DOWN
@@ -790,59 +905,97 @@ class MainActivity : Activity(), SurfaceHolder.Callback, View.OnTouchListener, V
                 continue
             }
 
-            val pointerId = event.getPointerId(p)
-            val x = event.getX(p)
-            val y = event.getY(p)
-            val rawPressure = event.getPressure(p)
-            val tiltRad = event.getAxisValue(MotionEvent.AXIS_TILT, p)
-            val orientRad = event.getAxisValue(MotionEvent.AXIS_ORIENTATION, p)
-            val tiltDeg = Math.toDegrees(tiltRad.toDouble()).toFloat()
-            val tiltX = (-Math.sin(orientRad.toDouble()) * tiltDeg).toFloat()
-            val tiltY = (Math.cos(orientRad.toDouble()) * tiltDeg).toFloat()
-
-            var effectiveToolType = toolType
-            var effectiveButtons = event.buttonState
-            val hasBarrel = (event.buttonState and (MotionEvent.BUTTON_STYLUS_PRIMARY or MotionEvent.BUTTON_SECONDARY)) != 0
-            if (hasBarrel) {
-                when (barrelMapping) {
-                    BarrelButtonMapping.RIGHT_CLICK -> effectiveButtons = 0x02
-                    BarrelButtonMapping.ERASER -> effectiveToolType = MotionEvent.TOOL_TYPE_ERASER
-                }
-            }
-
-            val pressure = if (effectiveToolType == MotionEvent.TOOL_TYPE_STYLUS) {
-                applyPressureCurve(rawPressure)
-            } else {
-                rawPressure
-            }
-
-            inkOverlayView.processSample(
-                pointerId = pointerId,
-                action = actionMasked,
-                toolType = effectiveToolType,
-                x = x,
-                y = y,
-                pressure = pressure,
-                tiltX = tiltX,
-                tiltY = tiltY
+            forwardPointerSample(
+                pointerId = event.getPointerId(p),
+                overlayAction = actionMasked,
+                nativeAction = action,
+                toolType = toolType,
+                buttonState = event.buttonState,
+                x = event.getX(p),
+                y = event.getY(p),
+                rawPressure = event.getPressure(p),
+                tiltRad = event.getAxisValue(MotionEvent.AXIS_TILT, p),
+                orientRad = event.getAxisValue(MotionEvent.AXIS_ORIENTATION, p),
+                width = width,
+                height = height,
+                timestampUs = eventTimeUs,
+                invalidateNow = false
             )
-
-            NativeEngine.sendPointerEvent(
-                pointerId = pointerId,
-                action = action,
-                toolType = effectiveToolType,
-                normX = toNormX(x, width),
-                normY = toNormY(y, height),
-                pressure = pressure,
-                tiltX = tiltX,
-                tiltY = tiltY,
-                buttons = effectiveButtons,
-                timestampUs = eventTimeUs
-            )
+            sentSample = true
         }
 
+        if (sentSample) {
+            inkOverlayView.invalidate()
+        }
         if (event.actionMasked == MotionEvent.ACTION_UP) v.performClick()
         return true
+    }
+
+    private fun forwardPointerSample(
+        pointerId: Int,
+        overlayAction: Int,
+        nativeAction: Int,
+        toolType: Int,
+        buttonState: Int,
+        x: Float,
+        y: Float,
+        rawPressure: Float,
+        tiltRad: Float,
+        orientRad: Float,
+        width: Float,
+        height: Float,
+        timestampUs: Long,
+        invalidateNow: Boolean = true
+    ) {
+        val tiltDeg = Math.toDegrees(tiltRad.toDouble()).toFloat()
+        val tiltX = (-Math.sin(orientRad.toDouble()) * tiltDeg).toFloat()
+        val tiltY = (Math.cos(orientRad.toDouble()) * tiltDeg).toFloat()
+
+        var effectiveToolType = toolType
+        var effectiveButtons = buttonState
+        val isStylus = toolType == MotionEvent.TOOL_TYPE_STYLUS || toolType == MotionEvent.TOOL_TYPE_ERASER
+        val hasBarrel = isStylus && (buttonState and (MotionEvent.BUTTON_STYLUS_PRIMARY or MotionEvent.BUTTON_SECONDARY)) != 0
+        if (hasBarrel) {
+            when (barrelMapping) {
+                BarrelButtonMapping.RIGHT_CLICK -> effectiveButtons = 0x02
+                BarrelButtonMapping.ERASER -> effectiveToolType = MotionEvent.TOOL_TYPE_ERASER
+            }
+        }
+
+        val pressure = when (effectiveToolType) {
+            MotionEvent.TOOL_TYPE_STYLUS -> applyPressureCurve(rawPressure)
+            MotionEvent.TOOL_TYPE_FINGER -> {
+                if (rawPressure > 0f) rawPressure
+                else if (nativeAction == 0 || nativeAction == 1) 1f
+                else 0f
+            }
+            else -> rawPressure
+        }
+
+        inkOverlayView.processSample(
+            pointerId = pointerId,
+            action = overlayAction,
+            toolType = effectiveToolType,
+            x = x,
+            y = y,
+            pressure = pressure,
+            tiltX = tiltX,
+            tiltY = tiltY,
+            invalidateNow = invalidateNow
+        )
+
+        NativeEngine.sendPointerEvent(
+            pointerId = pointerId,
+            action = nativeAction,
+            toolType = effectiveToolType,
+            normX = toNormX(x, width),
+            normY = toNormY(y, height),
+            pressure = pressure,
+            tiltX = tiltX,
+            tiltY = tiltY,
+            buttons = effectiveButtons,
+            timestampUs = timestampUs
+        )
     }
 
     override fun onGenericMotion(v: View, event: MotionEvent): Boolean {
@@ -854,28 +1007,34 @@ class MainActivity : Activity(), SurfaceHolder.Callback, View.OnTouchListener, V
             || actionMasked == MotionEvent.ACTION_HOVER_EXIT) {
             val width = v.width.toFloat()
             val height = v.height.toFloat()
-            if (width <= 0f || height <= 0f) return false
+            if (width <= 0f || height <= 0f || event.pointerCount == 0) return false
 
             val toolType = event.getToolType(0)
             if (penOnlyMode && toolType == MotionEvent.TOOL_TYPE_FINGER) {
                 return false
             }
 
-            val x = event.x
-            val y = event.y
-            val tiltRad = event.getAxisValue(MotionEvent.AXIS_TILT, 0)
-            val orientRad = event.getAxisValue(MotionEvent.AXIS_ORIENTATION, 0)
-            val tiltDeg = Math.toDegrees(tiltRad.toDouble()).toFloat()
-            val tiltX = (-Math.sin(orientRad.toDouble()) * tiltDeg).toFloat()
-            val tiltY = (Math.cos(orientRad.toDouble()) * tiltDeg).toFloat()
+            val pointerId = event.getPointerId(0)
+            val buttonState = event.buttonState
 
-            var effectiveToolType = toolType
-            var effectiveButtons = event.buttonState
-            val hasBarrel = (event.buttonState and (MotionEvent.BUTTON_STYLUS_PRIMARY or MotionEvent.BUTTON_SECONDARY)) != 0
-            if (hasBarrel) {
-                when (barrelMapping) {
-                    BarrelButtonMapping.RIGHT_CLICK -> effectiveButtons = 0x02
-                    BarrelButtonMapping.ERASER -> effectiveToolType = MotionEvent.TOOL_TYPE_ERASER
+            if (actionMasked == MotionEvent.ACTION_HOVER_MOVE) {
+                for (h in 0 until event.historySize) {
+                    forwardPointerSample(
+                        pointerId = pointerId,
+                        overlayAction = MotionEvent.ACTION_HOVER_MOVE,
+                        nativeAction = 4, // actions::HOVER_MOVE
+                        toolType = toolType,
+                        buttonState = buttonState,
+                        x = event.getHistoricalX(0, h),
+                        y = event.getHistoricalY(0, h),
+                        rawPressure = 0f,
+                        tiltRad = event.getHistoricalAxisValue(MotionEvent.AXIS_TILT, 0, h),
+                        orientRad = event.getHistoricalAxisValue(MotionEvent.AXIS_ORIENTATION, 0, h),
+                        width = width,
+                        height = height,
+                        timestampUs = event.getHistoricalEventTime(h) * 1000L,
+                        invalidateNow = false
+                    )
                 }
             }
 
@@ -886,28 +1045,21 @@ class MainActivity : Activity(), SurfaceHolder.Callback, View.OnTouchListener, V
                 else -> 4
             }
 
-            inkOverlayView.processSample(
-                pointerId = event.getPointerId(0),
-                action = actionMasked,
-                toolType = effectiveToolType,
-                x = x,
-                y = y,
-                pressure = 0f,
-                tiltX = tiltX,
-                tiltY = tiltY
-            )
-
-            NativeEngine.sendPointerEvent(
-                pointerId = event.getPointerId(0),
-                action = action,
-                toolType = effectiveToolType,
-                normX = toNormX(x, width),
-                normY = toNormY(y, height),
-                pressure = 0f,
-                tiltX = tiltX,
-                tiltY = tiltY,
-                buttons = effectiveButtons,
-                timestampUs = event.eventTime * 1000L
+            forwardPointerSample(
+                pointerId = pointerId,
+                overlayAction = actionMasked,
+                nativeAction = action,
+                toolType = toolType,
+                buttonState = buttonState,
+                x = event.x,
+                y = event.y,
+                rawPressure = 0f,
+                tiltRad = event.getAxisValue(MotionEvent.AXIS_TILT, 0),
+                orientRad = event.getAxisValue(MotionEvent.AXIS_ORIENTATION, 0),
+                width = width,
+                height = height,
+                timestampUs = event.eventTime * 1000L,
+                invalidateNow = true
             )
             return true
         }
@@ -921,6 +1073,10 @@ class MainActivity : Activity(), SurfaceHolder.Callback, View.OnTouchListener, V
         const val EXTRA_PORT = "port"
         const val EXTRA_NAME = "name"
         const val EXTRA_PIN = "pin"
+        const val EXTRA_USB_TETHER = "usb_tether"
+        const val EXTRA_HOST_ID = "host_id"
+
+        private const val TETHER_REDISCOVERY_DELAY_MS = 1500L
 
         private const val BACK_CONFIRM_MS = 2000L
         private const val MAX_ZOOM = 5f

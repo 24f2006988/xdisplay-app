@@ -4,11 +4,11 @@
 ; Installs everything the Windows side needs, with no other downloads:
 ;   - xdisplay-host.exe (dashboard + tray app that streams to the phone/tablet)
 ;   - the virtual display driver (MttVDD, MIT licensed) that gives Windows a real second monitor
-;   - Windows Firewall rules for Wi-Fi (local network only, optional)
+;   - one-time Windows Firewall & route-priority setup so USB Tethering works automatically for
+;     every Android device (no USB debugging, no per-device driver override) plus Wi-Fi
 ;   - (1.0.1) no longer installs UsbDk, and offers to remove the copy 1.0.0 installed: it is a
 ;     filter on every USB stack and blue-screened Windows (0x10D) when a device was unplugged
-;   - USB setup (XDisplay-USB-Setup.cmd): one-time, per device, binds Windows' own WinUSB driver
-;     so USB works with USB debugging off; no filter driver; undone on uninstall
+;   - legacy USB AOA setup (XDisplay-USB-Setup.cmd) kept as an optional fallback
 ;   - the Android app (APK) for copying to a device
 ;
 ; Build: scripts\build_release.ps1 (or ISCC.exe installer\xdisplay_setup.iss after building
@@ -17,11 +17,14 @@
 
 #define MyAppName "XDisplay"
 #ifndef MyAppVersion
-  #define MyAppVersion "1.0.2"
+  #define MyAppVersion "1.1.0"
 #endif
 #define MyAppPublisher "XDisplay contributors"
 #define MyAppURL "https://github.com/24f2006988/xdisplay-app"
 #define MyAppExeName "xdisplay-host.exe"
+#ifndef HostExe
+  #define HostExe "..\target\release\xdisplay-host.exe"
+#endif
 #define VddDir "{sd}\VirtualDisplayDriver"
 
 [Setup]
@@ -60,18 +63,21 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 Name: "autostart"; Description: "Start XDisplay in the tray when I sign in to Windows"; GroupDescription: "Startup:"; Flags: unchecked
-Name: "firewall"; Description: "Allow phones and tablets on my Wi-Fi to connect (Windows Firewall: TCP 59100 and UDP 59101, local network only)"; GroupDescription: "Wi-Fi:"; Flags: checkedonce
+Name: "firewall"; Description: "Allow Android devices to connect over USB Tethering and Wi-Fi (Windows Firewall, local network only)"; GroupDescription: "USB Tethering & Wi-Fi:"; Flags: checkedonce
+Name: "usbtetherroute"; Description: "Keep PC Wi-Fi/Ethernet as primary internet when USB Tethering is turned on (recommended)"; GroupDescription: "USB Tethering & Wi-Fi:"; Flags: checkedonce
 Name: "removeusbdk"; Description: "Remove the UsbDk USB driver that XDisplay 1.0.0 installed (recommended: it can crash Windows when a USB device is unplugged; needs a restart)"; GroupDescription: "USB:"; Check: UsbDkInstalledByMsi
 
 [Files]
-Source: "..\target\release\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#HostExe}"; DestDir: "{app}"; DestName: "{#MyAppExeName}"; Flags: ignoreversion
 ; Virtual display driver package and its display modes
 Source: "redist\vdd\*"; DestDir: "{app}\driver\vdd"; Flags: ignoreversion
 Source: "..\driver\vdd_settings.xml"; DestDir: "{#VddDir}"; Flags: ignoreversion
-; Wi-Fi helpers (firewall rules, connection troubleshooter)
+; USB Tethering & Wi-Fi setup helpers (one-time setup works for every Android device)
+Source: "..\scripts\setup_usb_tethering.ps1"; DestDir: "{app}\scripts"; Flags: ignoreversion
+Source: "..\XDisplay-USB-Tethering-Setup.cmd"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\scripts\setup_wifi_firewall.ps1"; DestDir: "{app}\scripts"; Flags: ignoreversion
 Source: "..\scripts\try_wifi.ps1"; DestDir: "{app}\scripts"; Flags: ignoreversion
-; USB without USB debugging: binds Windows' own WinUSB driver to the user's device (run once)
+; Optional legacy USB AOA setup (per-device WinUSB bind)
 Source: "..\scripts\usb_setup.ps1"; DestDir: "{app}\scripts"; Flags: ignoreversion
 Source: "..\XDisplay-USB-Setup.cmd"; DestDir: "{app}"; Flags: ignoreversion
 ; Android app, for copying to a phone or tablet
@@ -81,9 +87,10 @@ Source: "..\LICENSE"; DestDir: "{app}"; DestName: "LICENSE.txt"; Flags: ignoreve
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
-Name: "{group}\Wi-Fi troubleshooter"; Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -NoExit -File ""{app}\scripts\try_wifi.ps1"""
-Name: "{group}\USB setup (no USB debugging)"; Filename: "{app}\XDisplay-USB-Setup.cmd"; WorkingDir: "{app}"; Comment: "Plug in your device, then run this once"
-Name: "{group}\Undo USB setup"; Filename: "{app}\XDisplay-USB-Setup.cmd"; Parameters: "-Undo"; WorkingDir: "{app}"
+Name: "{group}\USB Tethering & Wi-Fi setup"; Filename: "{app}\XDisplay-USB-Tethering-Setup.cmd"; WorkingDir: "{app}"; Comment: "Re-apply firewall and USB Tethering route priority"
+Name: "{group}\Network troubleshooter"; Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -NoExit -File ""{app}\scripts\try_wifi.ps1"""
+Name: "{group}\Legacy USB AOA setup"; Filename: "{app}\XDisplay-USB-Setup.cmd"; WorkingDir: "{app}"; Comment: "Optional per-device WinUSB setup (not needed for USB Tethering)"
+Name: "{group}\Undo legacy USB AOA setup"; Filename: "{app}\XDisplay-USB-Setup.cmd"; Parameters: "-Undo"; WorkingDir: "{app}"
 Name: "{group}\Android app (APK)"; Filename: "{app}\android"
 Name: "{group}\Log files"; Filename: "{localappdata}\XDisplay\logs"
 Name: "{group}\{cm:UninstallProgram,{#MyAppName}}"; Filename: "{uninstallexe}"
@@ -101,11 +108,20 @@ Root: HKLM; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 ; (The virtual display driver is installed from [Code], in CurStepChanged(ssPostInstall).)
 ; One-shot cleanup at each sign-in: detaches a monitor left over by a crash or reboot (exits immediately)
 Filename: "schtasks.exe"; Parameters: "/Create /TN ""XDisplay\Detach Virtual Display"" /TR ""\""{app}\{#MyAppExeName}\"" --detach-display-if-host-absent"" /SC ONLOGON /RL LIMITED /F"; Flags: runhidden; StatusMsg: "Configuring display safety cleanup..."
-; Wi-Fi: stream (TCP) and discovery (UDP), local subnet only, Private/Domain networks
+; USB Tethering (wired local-subnet, Public+Private+Domain) & Wi-Fi (Private+Domain), scoped to xdisplay-host.exe.
+; Public Wi-Fi remains blocked; fallback ports also work automatically when Windows reserves 59100.
+Filename: "netsh.exe"; Parameters: "advfirewall firewall delete rule name=""XDisplay Host (USB Tethering TCP)"""; Flags: runhidden; Tasks: firewall
+Filename: "netsh.exe"; Parameters: "advfirewall firewall delete rule name=""XDisplay Host (USB Tethering UDP)"""; Flags: runhidden; Tasks: firewall
+Filename: "netsh.exe"; Parameters: "advfirewall firewall delete rule name=""XDisplay Host (Wi-Fi TCP)"""; Flags: runhidden; Tasks: firewall
+Filename: "netsh.exe"; Parameters: "advfirewall firewall delete rule name=""XDisplay Host (Wi-Fi UDP)"""; Flags: runhidden; Tasks: firewall
 Filename: "netsh.exe"; Parameters: "advfirewall firewall delete rule name=""XDisplay Host (Wi-Fi stream, TCP 59100)"""; Flags: runhidden; Tasks: firewall
 Filename: "netsh.exe"; Parameters: "advfirewall firewall delete rule name=""XDisplay Host (Wi-Fi discovery, UDP 59101)"""; Flags: runhidden; Tasks: firewall
-Filename: "netsh.exe"; Parameters: "advfirewall firewall add rule name=""XDisplay Host (Wi-Fi stream, TCP 59100)"" dir=in action=allow protocol=TCP localport=59100 profile=private,domain remoteip=localsubnet"; Flags: runhidden; Tasks: firewall; StatusMsg: "Configuring Windows Firewall for Wi-Fi..."
-Filename: "netsh.exe"; Parameters: "advfirewall firewall add rule name=""XDisplay Host (Wi-Fi discovery, UDP 59101)"" dir=in action=allow protocol=UDP localport=59101 profile=private,domain remoteip=localsubnet"; Flags: runhidden; Tasks: firewall
+Filename: "netsh.exe"; Parameters: "advfirewall firewall add rule name=""XDisplay Host (USB Tethering TCP)"" dir=in action=allow program=""{app}\{#MyAppExeName}"" protocol=TCP profile=public,private,domain interfacetype=lan remoteip=localsubnet"; Flags: runhidden; Tasks: firewall; StatusMsg: "Configuring Windows Firewall for USB Tethering and Wi-Fi..."
+Filename: "netsh.exe"; Parameters: "advfirewall firewall add rule name=""XDisplay Host (USB Tethering UDP)"" dir=in action=allow program=""{app}\{#MyAppExeName}"" protocol=UDP profile=public,private,domain interfacetype=lan remoteip=localsubnet"; Flags: runhidden; Tasks: firewall
+Filename: "netsh.exe"; Parameters: "advfirewall firewall add rule name=""XDisplay Host (Wi-Fi TCP)"" dir=in action=allow program=""{app}\{#MyAppExeName}"" protocol=TCP profile=private,domain remoteip=localsubnet"; Flags: runhidden; Tasks: firewall
+Filename: "netsh.exe"; Parameters: "advfirewall firewall add rule name=""XDisplay Host (Wi-Fi UDP)"" dir=in action=allow program=""{app}\{#MyAppExeName}"" protocol=UDP profile=private,domain remoteip=localsubnet"; Flags: runhidden; Tasks: firewall
+; Keep PC Wi-Fi/Ethernet as the primary internet route when any Android USB Tethering adapter connects.
+Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\scripts\setup_usb_tethering.ps1"" -HostExe ""{app}\{#MyAppExeName}"" -TaskOnly -Quiet"; Flags: runhidden; Tasks: usbtetherroute; StatusMsg: "Configuring USB Tethering route priority..."
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#MyAppName}}"; Flags: nowait postinstall skipifsilent runasoriginaluser
 
 [UninstallRun]
@@ -113,6 +129,11 @@ Filename: "taskkill.exe"; Parameters: "/IM {#MyAppExeName} /F"; Flags: runhidden
 Filename: "{app}\{#MyAppExeName}"; Parameters: "--detach-display-if-host-absent"; Flags: runhidden; RunOnceId: "DetachDisplay"
 Filename: "{app}\{#MyAppExeName}"; Parameters: "--remove-watchdog"; Flags: runhidden; RunOnceId: "StopWatchdog"
 Filename: "schtasks.exe"; Parameters: "/Delete /TN ""XDisplay\Detach Virtual Display"" /F"; Flags: runhidden; RunOnceId: "RemoveDisplaySafetyTask"
+Filename: "schtasks.exe"; Parameters: "/Delete /TN ""XDisplay\USB Tethering Route Priority"" /F"; Flags: runhidden; RunOnceId: "RemoveUsbTetherRouteTask"
+Filename: "netsh.exe"; Parameters: "advfirewall firewall delete rule name=""XDisplay Host (USB Tethering TCP)"""; Flags: runhidden; RunOnceId: "FwTetherTcp"
+Filename: "netsh.exe"; Parameters: "advfirewall firewall delete rule name=""XDisplay Host (USB Tethering UDP)"""; Flags: runhidden; RunOnceId: "FwTetherUdp"
+Filename: "netsh.exe"; Parameters: "advfirewall firewall delete rule name=""XDisplay Host (Wi-Fi TCP)"""; Flags: runhidden; RunOnceId: "FwWifiTcp"
+Filename: "netsh.exe"; Parameters: "advfirewall firewall delete rule name=""XDisplay Host (Wi-Fi UDP)"""; Flags: runhidden; RunOnceId: "FwWifiUdp"
 Filename: "netsh.exe"; Parameters: "advfirewall firewall delete rule name=""XDisplay Host (Wi-Fi stream, TCP 59100)"""; Flags: runhidden; RunOnceId: "FwTcp"
 Filename: "netsh.exe"; Parameters: "advfirewall firewall delete rule name=""XDisplay Host (Wi-Fi discovery, UDP 59101)"""; Flags: runhidden; RunOnceId: "FwUdp"
 Filename: "netsh.exe"; Parameters: "advfirewall firewall delete rule name=""XDisplay Host Stream"""; Flags: runhidden; RunOnceId: "FwLegacy"

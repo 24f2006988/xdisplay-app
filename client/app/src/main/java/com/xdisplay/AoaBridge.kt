@@ -137,6 +137,8 @@ class AoaBridge(
         client?.let { closeQuietly(it) }
         client = null
         closeQuietly(serverSocket)
+        closeQuietly(usbIn)
+        closeQuietly(usbOut)
         closeQuietly(pfd)
     }
 }

@@ -131,7 +131,7 @@ impl CursorEvent {
         if bytes.len() < Self::SIZE {
             return None;
         }
-        Some(*bytemuck::from_bytes(&bytes[..Self::SIZE]))
+        Some(bytemuck::pod_read_unaligned(&bytes[..Self::SIZE]))
     }
 }
 
@@ -363,5 +363,11 @@ mod tests {
 
         let parsed = CursorEvent::from_bytes(&bytes).expect("Valid cursor bytes");
         assert_eq!(cursor, parsed);
+
+        // Unaligned slices (e.g. arbitrary packet offsets) must decode without panicking.
+        let mut unaligned = [0u8; CursorEvent::SIZE + 1];
+        unaligned[1..].copy_from_slice(&bytes);
+        let parsed_unaligned = CursorEvent::from_bytes(&unaligned[1..]).expect("Unaligned cursor bytes");
+        assert_eq!(cursor, parsed_unaligned);
     }
 }

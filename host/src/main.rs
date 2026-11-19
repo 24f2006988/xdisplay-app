@@ -94,6 +94,10 @@ async fn run() -> Result<()> {
                 capture::virtual_display::remove_watchdog();
                 return Ok(());
             }
+            Some(transport::usb_tether::CONFIGURE_METRIC_ARG) => {
+                transport::usb_tether::configure_tether_metrics();
+                return Ok(());
+            }
             _ => {}
         }
     }

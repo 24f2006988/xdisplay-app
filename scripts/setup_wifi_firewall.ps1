@@ -16,6 +16,10 @@ param([switch]$Remove)
 
 $tcpRule = "XDisplay Host (Wi-Fi stream, TCP 59100)"
 $udpRule = "XDisplay Host (Wi-Fi discovery, UDP 59101)"
+$tetherTcpRule = "XDisplay Host (USB Tethering TCP)"
+$tetherUdpRule = "XDisplay Host (USB Tethering UDP)"
+$wifiTcpRule = "XDisplay Host (Wi-Fi TCP)"
+$wifiUdpRule = "XDisplay Host (Wi-Fi UDP)"
 $legacyRule = "XDisplay Host Stream"
 
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
@@ -28,7 +32,7 @@ if (-not $isAdmin) {
     exit
 }
 
-foreach ($name in @($tcpRule, $udpRule, $legacyRule)) {
+foreach ($name in @($tcpRule, $udpRule, $tetherTcpRule, $tetherUdpRule, $wifiTcpRule, $wifiUdpRule, $legacyRule)) {
     Remove-NetFirewallRule -DisplayName $name -ErrorAction SilentlyContinue
 }
 
@@ -38,11 +42,15 @@ if ($Remove) {
     exit
 }
 
+New-NetFirewallRule -DisplayName $tetherTcpRule -Direction Inbound -Action Allow -Protocol TCP -LocalPort 59100 `
+    -Profile Public, Private, Domain -InterfaceType Wired -RemoteAddress LocalSubnet | Out-Null
+New-NetFirewallRule -DisplayName $tetherUdpRule -Direction Inbound -Action Allow -Protocol UDP -LocalPort 59101 `
+    -Profile Public, Private, Domain -InterfaceType Wired -RemoteAddress LocalSubnet | Out-Null
 New-NetFirewallRule -DisplayName $tcpRule -Direction Inbound -Action Allow -Protocol TCP -LocalPort 59100 `
     -Profile Private, Domain -RemoteAddress LocalSubnet | Out-Null
 New-NetFirewallRule -DisplayName $udpRule -Direction Inbound -Action Allow -Protocol UDP -LocalPort 59101 `
     -Profile Private, Domain -RemoteAddress LocalSubnet | Out-Null
-Write-Host "Firewall rules added (TCP 59100 + UDP 59101, local subnet, Private/Domain networks)." -ForegroundColor Green
+Write-Host "Firewall rules added (USB Tethering on wired local subnet + Wi-Fi on Private/Domain networks)." -ForegroundColor Green
 
 # The usual reason Wi-Fi still fails afterwards: the network is classed as Public.
 $public = Get-NetConnectionProfile -ErrorAction SilentlyContinue | Where-Object { $_.NetworkCategory -eq "Public" }

@@ -4,16 +4,22 @@ import android.content.Context
 import android.content.SharedPreferences
 import java.security.SecureRandom
 
-/** Where the tablet connects: a PC over USB (adb reverse) or over Wi-Fi. */
+/** Where the tablet connects: a PC over USB (adb/AOA), USB Tethering, or Wi-Fi. */
 data class Target(
     val host: String,
     val port: Int,
-    val name: String
+    val name: String,
+    val isUsbTether: Boolean = false
 ) {
-    /** USB goes through `adb reverse`, which arrives on this device's own loopback. */
+    /** Direct USB goes through `adb reverse` or AOA bridge, which arrives on loopback. */
     val isUsb: Boolean get() = host == USB_HOST
 
-    val label: String get() = if (isUsb) "USB" else "$name ($host)"
+    val label: String
+        get() = when {
+            isUsb -> "USB"
+            isUsbTether -> "$name (USB Tethering)"
+            else -> "$name ($host)"
+        }
 
     companion object {
         const val USB_HOST = "127.0.0.1"
@@ -58,14 +64,23 @@ class ConnectionStore(context: Context) {
     var lastTarget: Target?
         get() {
             val host = prefs.getString(KEY_LAST_HOST, null) ?: return null
-            return Target(host, prefs.getInt(KEY_LAST_PORT, Target.DEFAULT_PORT), prefs.getString(KEY_LAST_NAME, host) ?: host)
+            return Target(
+                host,
+                prefs.getInt(KEY_LAST_PORT, Target.DEFAULT_PORT),
+                prefs.getString(KEY_LAST_NAME, host) ?: host,
+                prefs.getBoolean(KEY_LAST_USB_TETHER, false)
+            )
         }
         set(value) {
             val e = prefs.edit()
             if (value == null) {
                 e.remove(KEY_LAST_HOST)
+                e.remove(KEY_LAST_USB_TETHER)
             } else {
-                e.putString(KEY_LAST_HOST, value.host).putInt(KEY_LAST_PORT, value.port).putString(KEY_LAST_NAME, value.name)
+                e.putString(KEY_LAST_HOST, value.host)
+                    .putInt(KEY_LAST_PORT, value.port)
+                    .putString(KEY_LAST_NAME, value.name)
+                    .putBoolean(KEY_LAST_USB_TETHER, value.isUsbTether)
             }
             e.apply()
         }
@@ -87,5 +102,6 @@ class ConnectionStore(context: Context) {
         const val KEY_LAST_PORT = "last_port"
         const val KEY_LAST_NAME = "last_name"
         const val KEY_LAST_HOST_ID = "last_host_id"
+        const val KEY_LAST_USB_TETHER = "last_usb_tether"
     }
 }

@@ -2,7 +2,7 @@
 
 <h1 align="center">XDisplay</h1>
 
-<p align="center">Use an Android phone or tablet as a low-latency second monitor for Windows, with pen pressure, tilt and touch.</p>
+<p align="center">Use any Android phone or tablet as a low-latency second monitor for Windows, with pen pressure, tilt and touch.</p>
 
 <p align="center">
   <a href="https://github.com/24f2006988/xdisplay-app/releases/latest">Download</a> ·
@@ -13,25 +13,26 @@
 
 ---
 
-XDisplay adds a real extra monitor to Windows and streams it to your Android device over a USB
-cable or Wi-Fi. Windows sees the device as a normal display (extend, arrange, move windows onto
-it), and your pen and fingers on the device control Windows, so drawing apps get real pressure and
+XDisplay adds a real extra monitor to Windows and streams it to any Android device over **USB
+Tethering** or **Wi-Fi**. Windows sees the device as a normal display (extend, arrange, move
+windows onto it), and your pen and fingers control Windows, so drawing apps get real pressure and
 tilt.
 
 ## Features
 
+- **One-time Windows install — works for every Android device over USB Tethering.** Plug in any
+  Android phone or tablet, flip **USB Tethering** on, and XDisplay finds your PC automatically at
+  full wired USB speed (up to 120 Mbps, 60–144 Hz). No USB debugging, no Developer options, no
+  per-device driver setup, no file-transfer breakage, and your PC keeps its own Wi-Fi/Ethernet
+  internet.
 - **A real second monitor.** A virtual display driver gives Windows an extra screen sized to your
   device's panel (1:1 pixels when the resolution is known, 60 to 144 Hz).
-- **USB, no USB debugging needed.** Run **USB setup** once with the device plugged in; after that
-  you just plug it in. It binds Windows' own WinUSB driver to that one device (no extra driver, no
-  filter driver). With USB debugging on it works without the setup too. The first time, the PC
-  asks whether to allow the device; after that it reconnects by itself.
-- **Wi-Fi.** PCs on the network show up on the device automatically. Pair once with a 6-digit PIN;
-  after that the connection is encrypted and reconnects by itself.
+- **Wi-Fi.** PCs on the same Wi-Fi show up automatically too. Pair once with a 6-digit PIN; after
+  that every session is encrypted and reconnects by itself.
 - **Pen and touch.** Pressure curves, tilt, hover, barrel button as right-click or eraser, palm
   rejection (pen-only mode), multi-touch, two-finger scroll, and pinch-to-zoom on the device.
-- **Low latency.** GPU capture and hardware encoding (HEVC or H.264), hardware decoding on the
-  device, adaptive bitrate, and local predicted ink under the pen.
+- **Ultra-low latency.** GPU capture and hardware encoding (HEVC or H.264), hardware decoding on
+  the device, adaptive bitrate, 1 ms session timer pacing, and local predicted ink under the pen.
 - **Shortcut bar** with undo, redo, modifier keys and brush size for drawing apps.
 - **Any Android 8.0+ phone or tablet** (64-bit and 32-bit ARM, x86_64), in landscape.
 
@@ -40,34 +41,37 @@ tilt.
 | | |
 |---|---|
 | PC | Windows 10 version 1903 or later, or Windows 11 (64-bit). A GPU with hardware video encoding is strongly recommended (any recent NVIDIA, AMD or Intel GPU). |
-| Device | Android 8.0 or later, phone or tablet. A stylus is optional. |
+| Device | Any Android 8.0+ phone or tablet with a USB cable (or Wi-Fi). A stylus is optional. |
 | Wi-Fi mode | PC and device on the same network, with the network set to **Private** in Windows. 5 GHz Wi-Fi recommended. |
 
 ## Quick start
 
-1. **Windows:** download `XDisplay-Setup-<version>.exe` from
+1. **Windows (once):** download `XDisplay-Setup-<version>.exe` from
    [Releases](https://github.com/24f2006988/xdisplay-app/releases/latest) and run it. It installs
-   the app, the virtual display driver and the Wi-Fi firewall rules. Upgrading from 1.0.0, keep
-   "Remove the UsbDk USB driver" ticked. Restart Windows if it asks you to.
-2. **Android:** download `XDisplay-<version>.apk` on the device and open it (allow "install unknown
-   apps" for your browser or file manager when asked). The installer also puts a copy in
+   the app, the virtual display driver, the USB Tethering / Wi-Fi firewall rules, and route
+   protection so USB Tethering never steals your PC's Wi-Fi internet. Restart Windows only if it
+   asks you to.
+2. **Android (any phone or tablet):** download `XDisplay-<version>.apk` from
+   [Releases](https://github.com/24f2006988/xdisplay-app/releases/latest) and open it (allow
+   "install unknown apps" when asked). The Windows installer also puts a copy in
    `C:\Program Files\XDisplay\android\`.
-3. Start **XDisplay** on the PC (Start menu). It runs in the system tray; click the tray icon for
-   the dashboard.
-4. Connect:
-   - **USB (once per device):** plug the device in and set its USB mode to **File transfer**
-     (pull down the "Charging this device via USB" notification). Run **USB setup (no USB
-     debugging)** from the Start menu (or `XDisplay-USB-Setup.cmd`) and choose **Yes**. On the
-     device tap **OK** on "Open XDisplay for this USB accessory?" (tick "always"), and on the PC
-     choose **Yes** in the "allow new USB tablet?" prompt. From then on, just plug it in.
-
-     While set up, Windows cannot browse that device's files over USB. **Undo USB setup** in the
-     Start menu (or uninstalling XDisplay) gives it back its normal driver.
-
-     Alternatively turn on **USB debugging** (Settings > Developer options) instead of running the
-     setup; XDisplay then works over adb.
-   - **Wi-Fi:** open XDisplay on the device, tap your PC under **PCs on this Wi-Fi** (or type the
-     PC's IP address), and enter the PIN shown on the PC's dashboard. You only do this once.
+3. **Start XDisplay on the PC** (Start menu). It runs in the system tray; click the tray icon for
+   the dashboard and 6-digit pairing PIN.
+4. **Connect:**
+   - **USB Tethering (recommended — works on every Android device):**
+     1. Plug the device into your PC with a USB cable.
+     2. Open **XDisplay** on the phone/tablet and tap **Turn on USB Tethering** (this opens
+        Android's Tethering screen directly), then switch **USB tethering** ON and go back to
+        XDisplay.
+     3. Your PC appears immediately under **USB Tethering**. Tap it and enter the 6-digit PIN shown
+        on the PC dashboard once.
+     4. From then on, every time you plug in and toggle USB Tethering on, XDisplay **auto-connects**
+        at full wired speed — and any other Android phone or tablet works the exact same way with
+        zero extra PC setup.
+   - **Wi-Fi:** open XDisplay on the device, tap your PC under **PCs on Wi-Fi** (or type the PC's
+     IP address), and enter the 6-digit PIN once.
+   - **Other USB modes (optional):** USB debugging (`adb reverse`) and legacy per-device AOA USB
+     setup (`Legacy USB AOA setup` in the Start menu) continue to work if you prefer them.
 
 The device's screen now appears in Windows **Settings > System > Display** as an extra monitor;
 drag it to where it sits next to your main screen.
@@ -85,12 +89,12 @@ drag it to where it sits next to your main screen.
 
 | Problem | Fix |
 |---|---|
-| The device does not list the PC | Same Wi-Fi on both, and Windows must treat the network as **Private** (Settings > Network & internet > Wi-Fi > your network). Run **Wi-Fi troubleshooter** from the Start menu. You can also type the PC's IPv4 address. |
-| USB does nothing when plugged in | Run **USB setup (no USB debugging)** from the Start menu once, with the device plugged in and set to **File transfer**. Make sure XDisplay is running on the PC and installed on the device. Try another cable/port. Alternatively enable USB debugging on the device and install [Android platform tools](https://developer.android.com/tools/releases/platform-tools) (`winget install Google.PlatformTools`, or put `adb.exe` on PATH); XDisplay then uses adb automatically. |
-| Windows no longer shows the device's files | That is the USB setup. Run **Undo USB setup** from the Start menu, then replug the device. |
+| USB Tethering is on, but the device cannot find the PC | Make sure XDisplay is running on the PC, and run **USB Tethering & Wi-Fi setup** from the Start menu (or `XDisplay-USB-Tethering-Setup.cmd`) once as administrator so Windows Firewall allows wired local-subnet traffic even when Windows labels the USB adapter "Public". |
+| Turning on USB Tethering drops my PC's internet | Run **USB Tethering & Wi-Fi setup** from the Start menu (included in the installer by default). It keeps your PC's Wi-Fi/Ethernet at higher route priority than USB Tethering. |
+| The device does not list the PC on Wi-Fi | Same Wi-Fi on both, and Windows must treat the network as **Private** (Settings > Network & internet > Wi-Fi > your network). Run **Network troubleshooter** from the Start menu. You can also type the PC's IPv4 address. |
 | No second monitor appears, the main screen is mirrored instead | The virtual display driver is missing: run the installer again. |
-| Wrong or lost PIN | Dashboard > **Wi-Fi & Pairing** > **New PIN**. |
-| Picture is blurry or stutters on Wi-Fi | Use 5 GHz Wi-Fi close to the router, leave bitrate on **Auto**, or use USB. |
+| Wrong or lost PIN | Dashboard > **USB Tethering & Wi-Fi Pairing** > **New PIN**. |
+| Picture is blurry or stutters on Wi-Fi | Use **USB Tethering**, or use 5 GHz Wi-Fi close to the router with bitrate on **Auto**. |
 | A window is stuck on a screen you cannot see | Press `Win + P` and choose **PC screen only**, or start XDisplay and quit it from the tray. |
 | Installing the APK fails with "conflicts with an existing package" | An older build signed with a different key is installed. Uninstall XDisplay from the device first. |
 
@@ -99,10 +103,11 @@ them when [reporting a problem](https://github.com/24f2006988/xdisplay-app/issue
 
 ## Security
 
-USB connections are local and trusted. Network connections must pair with the PIN through a
-password-authenticated key exchange (SPAKE2); after that every packet is encrypted and
-authenticated (ChaCha20-Poly1305). The PIN is single-use and is replaced after five wrong
-attempts. The Windows firewall rules only allow your local subnet on Private/Domain networks.
+Every USB Tethering and Wi-Fi connection authenticates through a password-authenticated key
+exchange (SPAKE2) using the single-use 6-digit PIN (first time) or a 32-byte per-device secret
+(every reconnect), after which every packet is encrypted and authenticated with ChaCha20-Poly1305.
+The PIN is single-use and pauses pairing after five wrong attempts. The Windows Firewall rules are
+scoped strictly to `xdisplay-host.exe` on local subnets only — Public Wi-Fi remains closed.
 
 ## Building from source
 
@@ -129,9 +134,9 @@ Release APK signing reads a properties file (`storeFile`, `storePassword`, `keyA
 `keyPassword`) from `XDISPLAY_KEYSTORE_PROPERTIES` or `client\keystore.properties`; without one the
 release APK is unsigned. Keys are never committed.
 
-For development from a source checkout, `setup.bat` installs the driver and firewall rules and
-`run_xdisplay.bat` / `run_xdisplay_wifi.bat` start the host. Release builds of the host are a
-windowed app; `cargo run -p xdisplay-host` (debug) keeps a console for logs.
+For development from a source checkout, `setup.bat` installs the driver, USB Tethering setup, and
+firewall rules, and `run_xdisplay.bat` / `run_xdisplay_wifi.bat` start the host. Release builds of
+the host are a windowed app; `cargo run -p xdisplay-host` (debug) keeps a console for logs.
 
 Run the tests with `cargo test --workspace` and `cargo test` in `client\native`.
 

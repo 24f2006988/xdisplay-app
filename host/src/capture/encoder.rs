@@ -5,6 +5,7 @@ use openh264::OpenH264API;
 use std::ffi::c_void;
 use std::mem::ManuallyDrop;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::OnceLock;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
@@ -16,7 +17,8 @@ use windows::Win32::Graphics::Direct3D11::{
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::IDXGIDevice;
 use windows::Win32::Media::MediaFoundation::*;
-use windows::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, COINIT_MULTITHREADED};
+use windows::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, CoUninitialize, COINIT_MULTITHREADED};
+use windows::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL};
 use xdisplay_common::protocol::VideoCodec;
 
 /// One captured frame handed to an encoder.
@@ -69,7 +71,9 @@ pub unsafe fn device_from_raw(raw: *mut c_void) -> Option<ID3D11Device> {
 
 /// Number of input samples cycled through, so a sample is never rewritten while the MFT still reads it.
 const INPUT_RING: usize = 4;
-/// Longest the capture thread waits for the MFT to accept input before dropping the frame.
+/// Longest the capture thread waits for the MFT to accept its very first frame after startup.
+const FIRST_INPUT_WAIT: Duration = Duration::from_millis(250);
+/// Longest the capture thread waits for the MFT to accept input before dropping a steady-state frame.
 const INPUT_WAIT: Duration = Duration::from_millis(50);
 /// Longest the capture thread waits for the frame it just submitted to come out.
 const OUTPUT_WAIT: Duration = Duration::from_millis(40);
@@ -97,9 +101,9 @@ struct GpuInput {
 /// capture, would delay the last update before the screen goes idle indefinitely).
 pub struct MfVideoEncoder {
     codec: VideoCodec,
-    transform: IMFTransform,
+    transform: Option<IMFTransform>,
     codec_api: Option<ICodecAPI>,
-    events: Receiver<u32>,
+    events: Option<Receiver<u32>>,
     pump: Option<JoinHandle<()>>,
     gpu: Option<GpuInput>,
     samples: Vec<(IMFSample, IMFMediaBuffer)>,
@@ -252,13 +256,18 @@ impl MfVideoEncoder {
             .name("xdisplay-mft-events".into())
             .spawn(move || {
                 let pump_gen = pump_gen;
-                let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+                let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+                let com_init = CoInitializeEx(None, COINIT_MULTITHREADED).is_ok();
                 // Blocks until the next event; ends with MF_E_SHUTDOWN once the MFT is shut down.
                 while let Ok(ev) = pump_gen.0.GetEvent(MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS(0)) {
                     let kind = ev.GetType().unwrap_or(0);
                     if events_tx.send(kind).is_err() {
                         break;
                     }
+                }
+                drop(pump_gen);
+                if com_init {
+                    CoUninitialize();
                 }
             })
             .map_err(|e| anyhow!("Failed to spawn MFT event pump: {}", e))?;
@@ -279,9 +288,9 @@ impl MfVideoEncoder {
 
         Ok(Self {
             codec,
-            transform,
+            transform: Some(transform),
             codec_api,
-            events,
+            events: Some(events),
             pump: Some(pump),
             gpu,
             samples,
@@ -398,7 +407,8 @@ impl MfVideoEncoder {
     /// Waits for one event until `deadline`. Returns false on timeout.
     fn wait_event(&mut self, deadline: Instant, out: &mut Vec<Vec<u8>>) -> Result<bool> {
         let remaining = deadline.saturating_duration_since(Instant::now());
-        match self.events.recv_timeout(remaining) {
+        let events = self.events.as_ref().ok_or_else(|| anyhow!("MFT event receiver closed"))?;
+        match events.recv_timeout(remaining) {
             Ok(kind) => {
                 self.handle_event(kind, out)?;
                 Ok(true)
@@ -412,8 +422,8 @@ impl MfVideoEncoder {
         if kind == METransformNeedInput.0 as u32 {
             self.need_input += 1;
         } else if kind == METransformHaveOutput.0 as u32 {
-            self.in_flight = self.in_flight.saturating_sub(1);
             if let Some(bytes) = unsafe { self.pull_output()? } {
+                self.in_flight = self.in_flight.saturating_sub(1);
                 out.push(bytes);
             }
         }
@@ -421,6 +431,7 @@ impl MfVideoEncoder {
     }
 
     unsafe fn pull_output(&mut self) -> Result<Option<Vec<u8>>> {
+        let transform = self.transform.as_ref().ok_or_else(|| anyhow!("MFT transform shut down"))?;
         let mut buffers = [MFT_OUTPUT_DATA_BUFFER {
             dwStreamID: 0,
             pSample: ManuallyDrop::new(None),
@@ -428,14 +439,19 @@ impl MfVideoEncoder {
             pEvents: ManuallyDrop::new(None),
         }];
         let mut status = 0u32;
-        let result = self.transform.ProcessOutput(0, &mut buffers, &mut status);
+        let result = transform.ProcessOutput(0, &mut buffers, &mut status);
         let sample = ManuallyDrop::take(&mut buffers[0].pSample);
         drop(ManuallyDrop::take(&mut buffers[0].pEvents));
 
         if let Err(e) = result {
             if e.code() == MF_E_TRANSFORM_STREAM_CHANGE {
-                let t = self.transform.GetOutputAvailableType(0, 0)?;
-                self.transform.SetOutputType(0, &t, 0)?;
+                // Async MFT contract: set the updated output type and wait for the next
+                // METransformHaveOutput event rather than calling ProcessOutput again directly.
+                let t = transform.GetOutputAvailableType(0, 0)?;
+                transform.SetOutputType(0, &t, 0)?;
+                return Ok(None);
+            }
+            if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT {
                 return Ok(None);
             }
             return Err(anyhow!("ProcessOutput failed: {:?}", e));
@@ -468,11 +484,12 @@ impl VideoEncoder for MfVideoEncoder {
         let mut out = Vec::new();
 
         // Collect whatever the encoder signalled since the last call.
-        while let Ok(kind) = self.events.try_recv() {
+        while let Some(kind) = self.events.as_ref().and_then(|e| e.try_recv().ok()) {
             self.handle_event(kind, &mut out)?;
         }
 
-        let deadline = Instant::now() + INPUT_WAIT;
+        let input_wait = if self.frame_index == 0 { FIRST_INPUT_WAIT } else { INPUT_WAIT };
+        let deadline = Instant::now() + input_wait;
         while self.need_input == 0 {
             if !self.wait_event(deadline, &mut out)? {
                 debug!("Encoder did not request input in time; dropping frame");
@@ -487,7 +504,8 @@ impl VideoEncoder for MfVideoEncoder {
             let sample = &self.samples[idx].0;
             sample.SetSampleTime(self.frame_index as i64 * self.frame_duration_100ns)?;
             sample.SetSampleDuration(self.frame_duration_100ns)?;
-            self.transform.ProcessInput(0, sample, 0)?;
+            let transform = self.transform.as_ref().ok_or_else(|| anyhow!("MFT transform shut down"))?;
+            transform.ProcessInput(0, sample, 0)?;
         }
         self.frame_index += 1;
         self.need_input -= 1;
@@ -522,7 +540,7 @@ impl VideoEncoder for MfVideoEncoder {
 
     fn drain(&mut self) -> Result<Vec<Vec<u8>>> {
         let mut out = Vec::new();
-        while let Ok(kind) = self.events.try_recv() {
+        while let Some(kind) = self.events.as_ref().and_then(|e| e.try_recv().ok()) {
             self.handle_event(kind, &mut out)?;
         }
         // A few slow outputs (encoder start-up, a display re-attach, a busy GPU) raise
@@ -558,15 +576,24 @@ impl VideoEncoder for MfVideoEncoder {
 impl Drop for MfVideoEncoder {
     fn drop(&mut self) {
         unsafe {
-            let _ = self.transform.ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
-            let _ = self.transform.ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
-            if let Ok(shutdown) = self.transform.cast::<IMFShutdown>() {
-                let _ = shutdown.Shutdown();
+            if let Some(ref transform) = self.transform {
+                let _ = transform.ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
+                let _ = transform.ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
+                if let Ok(shutdown) = transform.cast::<IMFShutdown>() {
+                    let _ = shutdown.Shutdown();
+                }
             }
-            let _ = MFShutdown();
+            // Drop the channel receiver before joining so the pump thread exits promptly, and join
+            // the pump thread & release all MF COM objects *before* MFShutdown().
+            self.events = None;
             if let Some(pump) = self.pump.take() {
                 let _ = pump.join();
             }
+            self.samples.clear();
+            self.gpu = None;
+            self.codec_api = None;
+            self.transform = None;
+            let _ = MFShutdown();
         }
     }
 }
@@ -786,13 +813,17 @@ pub fn create_video_encoder_with_codec(
 }
 
 /// Checks whether the system possesses a hardware Media Foundation HEVC encoder (e.g. NVENC HEVC).
+/// Cached once so client handshakes never run synchronous MF/COM enumeration on async worker threads.
 pub fn supports_hardware_hevc() -> bool {
-    unsafe {
-        let _ = MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET);
-        let res = select_hardware_encoder(None, VideoCodec::Hevc);
+    static SUPPORTED: OnceLock<bool> = OnceLock::new();
+    *SUPPORTED.get_or_init(|| unsafe {
+        if MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET).is_err() {
+            return false;
+        }
+        let ok = select_hardware_encoder(None, VideoCodec::Hevc).is_ok();
         let _ = MFShutdown();
-        res.is_ok()
-    }
+        ok
+    })
 }
 
 #[cfg(test)]

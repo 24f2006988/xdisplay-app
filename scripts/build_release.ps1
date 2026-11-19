@@ -64,10 +64,28 @@ if ($apk -like "*unsigned*") { Write-Warning "The APK is unsigned (no keystore c
 Copy-Item $apk (Join-Path $dist "XDisplay-$version.apk") -Force
 
 Step "Windows host"
-Run cargo @("build", "--release", "-p", "xdisplay-host")
+$defaultHostExe = Join-Path $root "target\release\xdisplay-host.exe"
+$hostLocked = $false
+if (Test-Path $defaultHostExe) {
+    try {
+        $fs = [System.IO.File]::Open($defaultHostExe, 'Open', 'ReadWrite', 'None')
+        $fs.Close()
+    } catch {
+        $hostLocked = $true
+    }
+}
+if ($hostLocked) {
+    Write-Warning "target\release\xdisplay-host.exe is currently running; building into target\release-stage so your live display is not interrupted."
+    $stageDir = Join-Path $root "target\release-stage"
+    Run cargo @("build", "--release", "-p", "xdisplay-host", "--target-dir", $stageDir)
+    $hostExeForInstaller = Join-Path $stageDir "release\xdisplay-host.exe"
+} else {
+    Run cargo @("build", "--release", "-p", "xdisplay-host")
+    $hostExeForInstaller = $defaultHostExe
+}
 
 Step "Windows installer"
-Run $iscc @("/Q", "/DMyAppVersion=$version", (Join-Path $root "installer\xdisplay_setup.iss"))
+Run $iscc @("/Q", "/DMyAppVersion=$version", "/DHostExe=$hostExeForInstaller", (Join-Path $root "installer\xdisplay_setup.iss"))
 
 Step "Checksums"
 $files = @("XDisplay-$version.apk", "XDisplay-Setup-$version.exe")

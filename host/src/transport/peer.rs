@@ -262,5 +262,6 @@ mod tests {
         assert!(found.same_user, "child runs as this user");
         assert!(!is_trusted_loopback(peer, port));
         let _ = child.kill();
+        let _ = child.wait();
     }
 }

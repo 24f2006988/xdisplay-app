@@ -6,16 +6,17 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, Mutex, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{mpsc, watch, Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
 use super::framing::{PacketReader, PacketWriter};
 use super::handshake::host_handshake;
+use super::usb_tether;
 use crate::capture::rate_control::{Link, MIN_KBPS};
 use crate::capture::{find_virtual_display, monitor_rect, virtual_display, VideoPacket};
 use crate::input::spawn_cursor_tracker;
-use crate::shared::{HostShared, SessionInfo};
+use crate::shared::{HighResTimerGuard, HostShared, LinkKind, SessionInfo};
 use xdisplay_common::input::{KeyEvent, PointerEvent};
 use xdisplay_common::protocol::{
     flags, msg_types, ClientHello, ControlMessage, CursorEvent, PacketHeader, ServerConfig, VideoCodec, BITRATE_AUTO,
@@ -87,11 +88,22 @@ impl Drop for UsbLinkGuard {
 }
 
 /// Resets host state when a session ends for any reason, including being replaced.
-struct SessionGuard(Arc<HostShared>);
+/// Also holds a 1 ms timer-resolution guard for the session's lifetime so 120 Hz cursor polling
+/// and WGC idle-pump flushes stay precise without hurting battery while idle.
+struct SessionGuard {
+    shared: Arc<HostShared>,
+    _timer: HighResTimerGuard,
+}
+
+impl SessionGuard {
+    fn new(shared: Arc<HostShared>) -> Self {
+        Self { shared, _timer: HighResTimerGuard::acquire() }
+    }
+}
 
 impl Drop for SessionGuard {
     fn drop(&mut self) {
-        let shared = &self.0;
+        let shared = &self.shared;
         shared.client_connected.store(false, Ordering::Relaxed);
         shared.injector.lock().unwrap_or_else(|e| e.into_inner()).release_all();
         shared.keyboard.release_all();
@@ -134,7 +146,7 @@ impl TransportServer {
             Err(e) => return Err(e.into()),
         };
         let port = listener.local_addr()?.port();
-        info!("Transport server listening on {bind_host}:{port} (USB via adb reverse, Wi-Fi/LAN with pairing)");
+        info!("Transport server listening on {bind_host}:{port} (USB Tethering, Wi-Fi/LAN, ADB/AOA)");
         Ok(Self { listener, port, shared })
     }
 
@@ -234,19 +246,21 @@ async fn accept_loop(listener: TcpListener, ready: mpsc::Sender<AuthedConn>, sha
     }
 }
 
+type PerAddressMap = Arc<std::sync::Mutex<HashMap<IpAddr, usize>>>;
+
 /// Admission control for connections that have not authenticated yet. An unauthenticated peer
 /// can hold a slot for the whole handshake timeout, so without limits a single LAN device could
 /// open a handful of idle sockets and keep every real tablet (USB included) from connecting.
 struct HandshakeLimits {
     network: Arc<Semaphore>,
     loopback: Arc<Semaphore>,
-    per_address: Arc<std::sync::Mutex<HashMap<IpAddr, usize>>>,
+    per_address: PerAddressMap,
 }
 
 /// Holds a handshake slot; releases it (and the per-address count) on drop.
 struct HandshakePermit {
     _slot: OwnedSemaphorePermit,
-    address: Option<(IpAddr, Arc<std::sync::Mutex<HashMap<IpAddr, usize>>>)>,
+    address: Option<(IpAddr, PerAddressMap)>,
 }
 
 impl Drop for HandshakePermit {
@@ -338,10 +352,16 @@ async fn run_session(
     ctrl_rx: mpsc::Receiver<ControlMessage>,
 ) {
     let AuthedConn { reader, writer, hello, new_secret, peer, usb_link: _usb_link } = conn;
-    let remote = !peer.ip().is_loopback();
+    let link_kind = if peer.ip().is_loopback() {
+        LinkKind::UsbCable
+    } else if usb_tether::is_usb_tether_peer(peer.ip()) {
+        LinkKind::UsbTether
+    } else {
+        LinkKind::Wifi
+    };
     SESSION_EPOCH.fetch_add(1, Ordering::SeqCst);
-    let _guard = SessionGuard(shared.clone());
-    info!("Android client '{}' connected from {peer}", hello.device_name);
+    let _guard = SessionGuard::new(shared.clone());
+    info!("Android client '{}' connected from {peer} via {:?}", hello.device_name, link_kind);
 
     let attach_shared = shared.clone();
     let (panel_hz, panel_w, panel_h) = (hello.max_refresh_rate, hello.screen_width, hello.screen_height);
@@ -354,13 +374,14 @@ async fn run_session(
     }
 
     *shared.session.lock().unwrap_or_else(|e| e.into_inner()) =
-        Some(SessionInfo { device_name: hello.device_name.clone(), remote });
+        Some(SessionInfo { device_name: hello.device_name.clone(), link: link_kind });
 
-    // Channel for decoupled 120Hz hardware cursor packets (0 ms latency)
-    let (cursor_tx, cursor_rx) = mpsc::channel::<CursorEvent>(64);
+    // Latest-only watch channel for decoupled hardware cursor updates: stale positions are
+    // overwritten in place rather than piling up in a FIFO queue during brief link stalls.
+    let (cursor_tx, cursor_rx) = watch::channel::<Option<CursorEvent>>(None);
 
     let _cursor_task = AbortOnDrop(spawn_cursor_tracker(shared.clone(), cursor_tx));
-    let mut rx_task = AbortOnDrop(tokio::spawn(receive_loop(reader, shared.clone(), ctrl_tx, hello, new_secret, remote)));
+    let mut rx_task = AbortOnDrop(tokio::spawn(receive_loop(reader, shared.clone(), ctrl_tx, hello, new_secret, link_kind)));
     let mut tx_task = AbortOnDrop(tokio::spawn(send_loop(writer, shared.clone(), video_rx, ctrl_rx, cursor_rx)));
 
     tokio::select! {
@@ -381,7 +402,7 @@ fn show_tablet_display(shared: &HostShared, panel_hz: u32, panel_w: u32, panel_h
 }
 
 /// Applies the tablet's capabilities and returns the stream configuration to confirm to it.
-fn apply_hello(shared: &HostShared, hello: &ClientHello, remote: bool) -> ServerConfig {
+fn apply_hello(shared: &HostShared, hello: &ClientHello, link_kind: LinkKind) -> ServerConfig {
     info!(
         "Handshake verified for '{}' ({}x{} @ {}Hz, max pixel rate: {} Mpx/s, stylus: {})",
         hello.device_name,
@@ -405,8 +426,8 @@ fn apply_hello(shared: &HostShared, hello: &ClientHello, remote: bool) -> Server
     // produced on the same clock the panel refreshes on.
     shared.target_fps.store(active_disp.stream_fps(), Ordering::Relaxed);
 
-    let tablet_ratio = hello.screen_width as f32 / hello.screen_height as f32;
-    let current_ratio = active_disp.width as f32 / active_disp.height as f32;
+    let tablet_ratio = hello.screen_width as f32 / hello.screen_height.max(1) as f32;
+    let current_ratio = active_disp.width as f32 / active_disp.height.max(1) as f32;
     if (tablet_ratio - current_ratio).abs() < 0.05 {
         info!(
             "Display Aspect Ratio Match: Tablet {:.3} ({}x{}) vs Host Monitor {:.3} ({}x{}). Razor-sharp 1:1 pixel rendering with zero letterboxing.",
@@ -438,7 +459,10 @@ fn apply_hello(shared: &HostShared, hello: &ClientHello, remote: bool) -> Server
     // link that dies looks congested for seconds before it times out, which used to throttle
     // the stream to its floor and leave the next session blurry and stuttering while it climbed
     // back up.
-    let link = if remote { Link::Network } else { Link::Usb };
+    let link = match link_kind {
+        LinkKind::UsbCable | LinkKind::UsbTether => Link::Usb,
+        LinkKind::Wifi => Link::Network,
+    };
     let start = shared.start_session_bitrate(link);
     info!(
         "Session bitrate: {} up to {} kbps over {:?}, starting at {start} kbps",
@@ -469,14 +493,14 @@ async fn receive_loop(
     ctrl_tx: mpsc::Sender<ControlMessage>,
     hello: ClientHello,
     new_secret: Option<DeviceSecret>,
-    remote: bool,
+    link_kind: LinkKind,
 ) {
     let mut events: Vec<PointerEvent> = Vec::with_capacity(256);
 
     if let Some(device_secret) = new_secret {
         let _ = ctrl_tx.send(ControlMessage::PairingComplete { device_secret }).await;
     }
-    let config = apply_hello(&shared, &hello, remote);
+    let config = apply_hello(&shared, &hello, link_kind);
     let _ = ctrl_tx.send(ControlMessage::ServerConfig(config)).await;
     shared.request_idr.store(true, Ordering::Relaxed);
     shared.client_connected.store(true, Ordering::Relaxed);
@@ -520,7 +544,10 @@ async fn receive_loop(
                             shared.target_fps.store(clamped_fps, Ordering::Relaxed);
                         }
                         drop(d);
-                        let link = if remote { Link::Network } else { Link::Usb };
+                        let link = match link_kind {
+                            LinkKind::UsbCable | LinkKind::UsbTether => Link::Usb,
+                            LinkKind::Wifi => Link::Network,
+                        };
                         match update.bitrate_kbps {
                             Some(BITRATE_AUTO) => shared.choose_auto_bitrate(),
                             Some(kbps) => shared.choose_bitrate_kbps(kbps.clamp(MIN_KBPS, MAX_MANUAL_KBPS)),
@@ -604,7 +631,7 @@ async fn send_loop(
     shared: Arc<HostShared>,
     video_rx: Arc<Mutex<mpsc::Receiver<VideoPacket>>>,
     mut ctrl_rx: mpsc::Receiver<ControlMessage>,
-    mut cursor_rx: mpsc::Receiver<CursorEvent>,
+    mut cursor_rx: watch::Receiver<Option<CursorEvent>>,
 ) {
     let mut frame_seq = 0u32;
     let mut cursor_seq = 0u32;
@@ -612,31 +639,40 @@ async fn send_loop(
     let mut video_rx = video_rx.lock_owned().await;
 
     // Step 1: Deliver the pairing secret (if any) and the initial ServerConfig before any video.
-    loop {
+    let initial_config = loop {
         let Some(msg) = ctrl_rx.recv().await else { return };
         if let Err(e) = send_control(&mut writer, &mut ctrl_seq, &msg).await {
             warn!("Failed to write initial control message: {e}");
             return;
         }
-        if matches!(msg, ControlMessage::ServerConfig(_)) {
-            break;
+        if let ControlMessage::ServerConfig(cfg) = msg {
+            break cfg;
         }
-    }
+    };
 
-    // Step 2: Send cached IDR keyframe if available to immediately populate the screen on connect
+    // Step 2: Send cached IDR keyframe if available *and* its codec & resolution match the
+    // negotiated stream so a newly connected tablet gets an instant picture without codec mismatch.
     let cached = shared.latest_idr.lock().ok().and_then(|g| g.clone());
-    if let Some(idr_pkt) = cached {
+    if let Some(idr) = cached.filter(|c| {
+        c.codec == initial_config.codec
+            && c.width == initial_config.stream_width
+            && c.height == initial_config.stream_height
+    }) {
+        let mut flag = flags::KEYFRAME;
+        if idr.packet.is_config {
+            flag |= flags::CONFIG;
+        }
         let header = PacketHeader::new(
             msg_types::VIDEO_RAW,
-            flags::CONFIG | flags::KEYFRAME,
+            flag,
             0,
             frame_seq,
-            idr_pkt.data.len() as u32,
-            idr_pkt.pts_us,
+            idr.packet.data.len() as u32,
+            idr.packet.pts_us,
         );
         frame_seq = frame_seq.wrapping_add(1);
-        if writer.send(header, &idr_pkt.data).await.is_ok() {
-            info!("Sent immediate cached IDR keyframe ({} bytes) on client connect", idr_pkt.data.len());
+        if writer.send(header, &idr.packet.data).await.is_ok() {
+            info!("Sent immediate cached IDR keyframe ({} bytes) on client connect", idr.packet.data.len());
         }
     }
 
@@ -644,16 +680,23 @@ async fn send_loop(
         tokio::select! {
             biased;
 
-            // Priority 1: control messages (ServerConfig, Pong)
+            // Priority 1: control messages (ServerConfig, Pong, SessionTaken)
             Some(msg) = ctrl_rx.recv() => {
+                let end_session = matches!(msg, ControlMessage::SessionTaken { .. });
                 if let Err(e) = send_control(&mut writer, &mut ctrl_seq, &msg).await {
                     warn!("Error writing control packet: {}", e);
                     break;
                 }
+                if end_session {
+                    break;
+                }
             }
 
-            // Priority 2: Decoupled 120Hz Hardware Cursor Updates (0 ms visual latency)
-            Some(cursor_evt) = cursor_rx.recv() => {
+            // Priority 2: Decoupled Hardware Cursor Updates (latest-only, zero queue lag)
+            Ok(()) = cursor_rx.changed() => {
+                let Some(cursor_evt) = *cursor_rx.borrow_and_update() else {
+                    continue;
+                };
                 let payload = cursor_evt.to_bytes();
                 let hdr = PacketHeader::new(
                     msg_types::CURSOR_EVENT,
@@ -679,8 +722,9 @@ async fn send_loop(
 
                 let mut flag = flags::NONE;
                 if pkt.is_config {
-                    flag |= flags::CONFIG | flags::KEYFRAME;
-                } else if pkt.is_keyframe {
+                    flag |= flags::CONFIG;
+                }
+                if pkt.is_keyframe {
                     flag |= flags::KEYFRAME;
                 }
 

@@ -6,7 +6,11 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use xdisplay_common::protocol::{flags, PacketHeader, HEADER_SIZE, PROTOCOL_VERSION};
-use xdisplay_common::{Opener, Sealer};
+use xdisplay_common::{Opener, Sealer, TAG_LEN};
+
+/// Small packets (control, cursor, input) are coalesced on the stack so they always go out in
+/// a single syscall and single TCP segment under TCP_NODELAY.
+const STACK_COALESCE_LIMIT: usize = 2048;
 
 /// Writes header and payload with as few syscalls as possible (normally one), so the 24-byte
 /// header never goes out as its own TCP segment under TCP_NODELAY.
@@ -16,6 +20,13 @@ pub async fn write_packet<W: AsyncWrite + Unpin>(
     payload: &[u8],
 ) -> std::io::Result<()> {
     let hdr = header.to_bytes();
+    if payload.len() <= STACK_COALESCE_LIMIT {
+        let mut buf = [0u8; HEADER_SIZE + STACK_COALESCE_LIMIT];
+        buf[..HEADER_SIZE].copy_from_slice(&hdr);
+        buf[HEADER_SIZE..HEADER_SIZE + payload.len()].copy_from_slice(payload);
+        writer.write_all(&buf[..HEADER_SIZE + payload.len()]).await?;
+        return writer.flush().await;
+    }
     let mut bufs = [IoSlice::new(&hdr), IoSlice::new(payload)];
     let mut slices: &mut [IoSlice<'_>] = &mut bufs;
     while !slices.is_empty() {
@@ -94,14 +105,34 @@ impl<W: AsyncWrite + Unpin> PacketWriter<W> {
 
     pub async fn send(&mut self, mut header: PacketHeader, payload: &[u8]) -> std::io::Result<()> {
         match &mut self.sealer {
-            None => write_packet(&mut self.writer, &header, payload).await,
+            None => {
+                if payload.len() <= STACK_COALESCE_LIMIT || self.writer.is_write_vectored() {
+                    write_packet(&mut self.writer, &header, payload).await
+                } else {
+                    // Underlying writer does not support vectored I/O (e.g. non-vectored Windows
+                    // pipes/sockets): coalesce into the reused scratch buffer so the 24-byte
+                    // header never leaves as a separate TCP segment under TCP_NODELAY.
+                    self.scratch.clear();
+                    self.scratch.reserve(HEADER_SIZE + payload.len());
+                    self.scratch.extend_from_slice(&header.to_bytes());
+                    self.scratch.extend_from_slice(payload);
+                    self.writer.write_all(&self.scratch).await?;
+                    self.writer.flush().await
+                }
+            }
             Some(sealer) => {
+                let total = HEADER_SIZE + payload.len() + TAG_LEN;
                 self.scratch.clear();
+                self.scratch.reserve(total);
+                self.scratch.resize(HEADER_SIZE, 0);
                 self.scratch.extend_from_slice(payload);
-                sealer
-                    .seal(&mut header, &mut self.scratch)
+                let tag = sealer
+                    .seal_in_place(&mut header, &mut self.scratch[HEADER_SIZE..])
                     .map_err(|e| std::io::Error::other(e.to_string()))?;
-                write_packet(&mut self.writer, &header, &self.scratch).await
+                self.scratch[..HEADER_SIZE].copy_from_slice(&header.to_bytes());
+                self.scratch.extend_from_slice(&tag);
+                self.writer.write_all(&self.scratch).await?;
+                self.writer.flush().await
             }
         }
     }

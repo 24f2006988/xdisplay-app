@@ -8,15 +8,27 @@ use crate::stats::PipelineStats;
 use crate::transport::PairingStore;
 use xdisplay_common::protocol::VideoCodec;
 
+/// Attaches the calling thread to the interactive `"Default"` desktop once per thread.
+/// Caching per thread avoids both kernel handle leaks and repeated syscalls on the 240 Hz
+/// input fast path.
 #[cfg(windows)]
 pub fn attach_to_default_desktop() {
+    use std::cell::Cell;
+    thread_local! {
+        static ATTACHED: Cell<bool> = const { Cell::new(false) };
+    }
+    if ATTACHED.with(Cell::get) {
+        return;
+    }
     unsafe {
-        use windows::Win32::System::StationsAndDesktops::{
-            OpenDesktopW, SetThreadDesktop, DESKTOP_CONTROL_FLAGS,
-        };
         use windows::core::w;
+        use windows::Win32::System::StationsAndDesktops::{
+            CloseDesktop, OpenDesktopW, SetThreadDesktop, DESKTOP_CONTROL_FLAGS,
+        };
         if let Ok(hdesk) = OpenDesktopW(w!("Default"), DESKTOP_CONTROL_FLAGS(0), false, 0x01FF) {
             let _ = SetThreadDesktop(hdesk);
+            let _ = CloseDesktop(hdesk);
+            ATTACHED.with(|a| a.set(true));
         }
     }
 }
@@ -24,20 +36,92 @@ pub fn attach_to_default_desktop() {
 #[cfg(not(windows))]
 pub fn attach_to_default_desktop() {}
 
+/// Nudges a latency-sensitive streaming thread (capture, MFT event pump, USB bridge) above normal
+/// background work so heavy apps on the PC do not stall frame delivery.
+#[cfg(windows)]
+pub fn raise_thread_priority() {
+    unsafe {
+        use windows::Win32::System::Threading::{
+            GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
+        };
+        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    }
+}
+
+#[cfg(not(windows))]
+pub fn raise_thread_priority() {}
+
+/// Requests 1 ms Windows timer resolution while held (for the duration of an active session) so
+/// 120 Hz cursor polling, WGC idle-pump flushes, and tokio timers do not quantize to 15.6 ms.
+pub struct HighResTimerGuard {
+    #[cfg(windows)]
+    active: bool,
+}
+
+impl HighResTimerGuard {
+    pub fn acquire() -> Self {
+        #[cfg(windows)]
+        {
+            #[link(name = "winmm")]
+            extern "system" {
+                fn timeBeginPeriod(uperiod: u32) -> u32;
+            }
+            let active = unsafe { timeBeginPeriod(1) == 0 };
+            Self { active }
+        }
+        #[cfg(not(windows))]
+        Self {}
+    }
+}
+
+impl Drop for HighResTimerGuard {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        if self.active {
+            #[link(name = "winmm")]
+            extern "system" {
+                fn timeEndPeriod(uperiod: u32) -> u32;
+            }
+            unsafe {
+                timeEndPeriod(1);
+            }
+        }
+    }
+}
+
+/// Cached keyframe tagged with the stream format it was encoded for, so a new client with a
+/// different codec or resolution never receives an incompatible IDR.
+#[derive(Clone, Debug)]
+pub struct CachedIdr {
+    pub packet: VideoPacket,
+    pub codec: VideoCodec,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Physical transport carrying the current session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkKind {
+    /// Direct USB via ADB reverse or AOA accessory bridge (loopback on the host).
+    UsbCable,
+    /// Android USB Tethering (RNDIS / USB NCM — full wired USB speed, encrypted).
+    UsbTether,
+    /// Wi-Fi or local Ethernet LAN (encrypted).
+    Wifi,
+}
+
 /// Who is connected right now, for the dashboard.
 #[derive(Debug, Clone)]
 pub struct SessionInfo {
     pub device_name: String,
-    /// Connected over the network (always authenticated and encrypted) rather than USB.
-    pub remote: bool,
+    pub link: LinkKind,
 }
 
 impl SessionInfo {
     pub fn link(&self) -> Link {
-        if self.remote {
-            Link::Network
-        } else {
-            Link::Usb
+        match self.link {
+            LinkKind::UsbCable | LinkKind::UsbTether => Link::Usb,
+            LinkKind::Wifi => Link::Network,
         }
     }
 }
@@ -46,8 +130,9 @@ impl SessionInfo {
 pub struct HostShared {
     pub injector: Mutex<PointerInjector>,
     pub keyboard: KeyboardInjector,
-    /// Most recent decodable keyframe (SPS/PPS + IDR), replayed to newly connected clients.
-    pub latest_idr: Mutex<Option<VideoPacket>>,
+    /// Most recent decodable keyframe (SPS/PPS + IDR), replayed to newly connected clients
+    /// when its codec and resolution match the negotiated stream.
+    pub latest_idr: Mutex<Option<CachedIdr>>,
     pub request_idr: AtomicBool,
     /// Capture skips encoding entirely while nobody is connected.
     pub client_connected: AtomicBool,
@@ -107,6 +192,18 @@ impl HostShared {
             manual_bitrate_kbps: AtomicU32::new(0),
             usb_links: AtomicU32::new(0),
         }
+    }
+
+    /// Applies an explicit FPS choice from the dashboard.
+    pub fn choose_fps(&self, fps: u32) {
+        let clamped = fps.clamp(30, 144);
+        self.target_fps.store(clamped, Ordering::Relaxed);
+        let link = self.session.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|s| s.link());
+        if let Some(link) = link {
+            self.stream_rate_changed(link);
+        }
+        self.reconfigure_encoder.store(true, Ordering::Relaxed);
+        self.request_idr.store(true, Ordering::Relaxed);
     }
 
     /// Applies an explicit bitrate choice (dashboard or tablet settings).
@@ -171,6 +268,9 @@ impl HostShared {
         let Some(live) = crate::capture::find_virtual_display(std::time::Duration::ZERO) else {
             return;
         };
+        if live.width == 0 || live.height == 0 {
+            return;
+        }
         let mut d = self.display.lock().unwrap_or_else(|e| e.into_inner());
         if (d.hmonitor, d.left, d.top, d.width, d.height) == (live.hmonitor, live.left, live.top, live.width, live.height) {
             return;

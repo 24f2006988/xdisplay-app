@@ -25,15 +25,39 @@ class InkOverlayView(context: Context) : View(context) {
     private var canvasBitmap: Bitmap? = null
     private var drawCanvas: Canvas? = null
 
-    // Active pointer tracking (zero-allocation fixed array instead of HashMap)
+    // Active pointer tracking (zero-allocation fixed pool supporting arbitrary Android pointer IDs)
     private class CachedPointer {
         var active: Boolean = false
+        var pointerId: Int = -1
         var x: Float = 0f
         var y: Float = 0f
         var pressure: Float = 0f
         var toolType: Int = 0
     }
     private val cachedPointers = Array(16) { CachedPointer() }
+
+    private fun findPointerSlot(pointerId: Int, allocate: Boolean): CachedPointer? {
+        var free: CachedPointer? = null
+        for (i in cachedPointers.indices) {
+            val slot = cachedPointers[i]
+            if (slot.active && slot.pointerId == pointerId) {
+                return slot
+            }
+            if (free == null && !slot.active) {
+                free = slot
+            }
+        }
+        if (allocate && free != null) {
+            free.pointerId = pointerId
+            return free
+        }
+        return null
+    }
+
+    // Pre-allocated Typefaces (reused across HUD, menus and 120 Hz landing pulse to prevent GC churn)
+    private val typefaceDefaultBold: Typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+    private val typefaceMonoBold: Typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+    private val typefaceMonoNormal: Typeface = Typeface.create(Typeface.MONOSPACE, Typeface.NORMAL)
 
     // Colors
     private val colorStylus = Color.rgb(0, 240, 255)    // Cyber Cyan
@@ -97,8 +121,7 @@ class InkOverlayView(context: Context) : View(context) {
     private val choreographerFrameCallback = object : android.view.Choreographer.FrameCallback {
         override fun doFrame(frameTimeNanos: Long) {
             if (!vsyncRunning) return
-            val changed = updateCursorFromNative()
-            if (changed) {
+            if (linkStatus == NativeEngine.STATUS_CONNECTED && updateCursorFromNative()) {
                 invalidate()
             }
             android.view.Choreographer.getInstance().postFrameCallback(this)
@@ -119,19 +142,19 @@ class InkOverlayView(context: Context) : View(context) {
     private val textTitlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.WHITE
         textSize = 34f
-        typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+        typeface = typefaceMonoBold
     }
 
     private val textBodyPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.rgb(200, 215, 230)
         textSize = 26f
-        typeface = Typeface.create(Typeface.MONOSPACE, Typeface.NORMAL)
+        typeface = typefaceMonoNormal
     }
 
     private val textAccentPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = colorStylus
         textSize = 26f
-        typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+        typeface = typefaceMonoBold
     }
 
     private val barBgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -158,7 +181,7 @@ class InkOverlayView(context: Context) : View(context) {
         color = Color.WHITE
         textSize = 26f
         textAlign = Paint.Align.CENTER
-        typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+        typeface = typefaceDefaultBold
     }
 
     // Zero-allocation Circular Ring Buffer for fading stroke segments (Feature #10)
@@ -184,6 +207,7 @@ class InkOverlayView(context: Context) : View(context) {
     }
     var inkMode: InkMode = InkMode.FADE
         set(value) {
+            if (field == value) return
             field = value
             if (value == InkMode.PERSIST) {
                 ensurePersistentBitmap()
@@ -212,12 +236,25 @@ class InkOverlayView(context: Context) : View(context) {
 
     // Live Diagnostics State
     var linkStatus: Int = NativeEngine.STATUS_DISCONNECTED
+        set(value) {
+            val wasConnected = field == NativeEngine.STATUS_CONNECTED
+            field = value
+            if (wasConnected && value != NativeEngine.STATUS_CONNECTED) {
+                // Host releases all held keys/contacts on disconnect; keep sidebar toggle pills in sync.
+                isCtrlLatched = false
+                isShiftLatched = false
+                isAltLatched = false
+                isSpaceLatched = false
+                cursorVisible = false
+            }
+        }
 
     /** Human-readable connection target shown in the HUD, e.g. "USB" or "Desk PC (192.168.1.20)". */
     var targetLabel: String = "USB"
 
-    /** Selects the wording of the waiting screen: cable instructions vs. network ones. */
+    /** Selects the wording of the waiting screen: loopback cable vs. USB tethering vs. Wi-Fi. */
     var isUsbLink: Boolean = true
+    var isUsbTetherLink: Boolean = false
     var packetsSent: Long = 0L
     var rttUs: Long = 0L
 
@@ -262,12 +299,28 @@ class InkOverlayView(context: Context) : View(context) {
     // Landing Screen (Phase 1.3 - Cyberpunk Obsidian Landing Screen)
     private val landingRingPaint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val landingIconPaint = Paint(Paint.ANTI_ALIAS_FLAG)
-    private val landingTitlePaint = Paint(Paint.ANTI_ALIAS_FLAG)
-    private val landingSubPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val landingTitlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.WHITE
+        textAlign = Paint.Align.CENTER
+        typeface = typefaceDefaultBold
+    }
+    private val landingSubPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.rgb(0, 240, 255)
+        textAlign = Paint.Align.CENTER
+        typeface = typefaceMonoBold
+    }
     private val landingBadgePaint = Paint(Paint.ANTI_ALIAS_FLAG)
-    private val landingStatusTextPaint = Paint(Paint.ANTI_ALIAS_FLAG)
-    private val landingTipPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val landingStatusTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.WHITE
+        textAlign = Paint.Align.LEFT
+        typeface = typefaceMonoBold
+    }
+    private val landingTipPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        textAlign = Paint.Align.CENTER
+        typeface = typefaceMonoNormal
+    }
     private val landingIconRect = RectF()
+    private val landingBadgeRect = RectF()
 
     // Stream & Gesture Settings Modal (Feature #2 & #4)
     var showSettingsModal: Boolean = false
@@ -395,15 +448,24 @@ class InkOverlayView(context: Context) : View(context) {
         invalidate()
     }
 
+    fun setVsyncActive(active: Boolean) {
+        if (active == vsyncRunning) return
+        vsyncRunning = active
+        val choreographer = android.view.Choreographer.getInstance()
+        choreographer.removeFrameCallback(choreographerFrameCallback)
+        if (active && isAttachedToWindow) {
+            choreographer.postFrameCallback(choreographerFrameCallback)
+        }
+    }
+
     override fun onAttachedToWindow() {
         super.onAttachedToWindow()
-        vsyncRunning = true
-        android.view.Choreographer.getInstance().postFrameCallback(choreographerFrameCallback)
+        setVsyncActive(true)
     }
 
     override fun onDetachedFromWindow() {
         super.onDetachedFromWindow()
-        vsyncRunning = false
+        setVsyncActive(false)
     }
 
     private fun updateCursorFromNative(): Boolean {
@@ -436,17 +498,19 @@ class InkOverlayView(context: Context) : View(context) {
 
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
         super.onSizeChanged(w, h, oldw, oldh)
-        if (!inkFadeEnabled) {
+        if (inkMode == InkMode.PERSIST) {
             ensurePersistentBitmap(w, h)
         }
     }
 
     private fun ensurePersistentBitmap(w: Int = width, h: Int = height) {
-        if (w > 0 && h > 0 && canvasBitmap == null) {
-            val newBmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-            drawCanvas = Canvas(newBmp)
-            canvasBitmap = newBmp
-        }
+        if (w <= 0 || h <= 0) return
+        val existing = canvasBitmap
+        if (existing != null && existing.width == w && existing.height == h) return
+        existing?.recycle()
+        val newBmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        drawCanvas = Canvas(newBmp)
+        canvasBitmap = newBmp
     }
 
     private fun releasePersistentBitmap() {
@@ -463,6 +527,7 @@ class InkOverlayView(context: Context) : View(context) {
         canvasBitmap?.eraseColor(Color.TRANSPARENT)
         for (i in cachedPointers.indices) {
             cachedPointers[i].active = false
+            cachedPointers[i].pointerId = -1
         }
         segHead = 0
         segTail = 0
@@ -480,34 +545,26 @@ class InkOverlayView(context: Context) : View(context) {
         isEraser: Boolean,
         now: Long
     ) {
-        if (segCount < MAX_SEGMENTS) {
-            segX1[segHead] = x1
-            segY1[segHead] = y1
-            segX2[segHead] = x2
-            segY2[segHead] = y2
-            segWidth[segHead] = strokeWidth
-            segColor[segHead] = color
-            segIsEraser[segHead] = isEraser
-            segTimestamp[segHead] = now
-            segHead = (segHead + 1) % MAX_SEGMENTS
-            segCount++
-        } else {
+        if (segCount == MAX_SEGMENTS) {
             // Overwrite oldest segment
             segTail = (segTail + 1) % MAX_SEGMENTS
-            segX1[segHead] = x1
-            segY1[segHead] = y1
-            segX2[segHead] = x2
-            segY2[segHead] = y2
-            segWidth[segHead] = strokeWidth
-            segColor[segHead] = color
-            segIsEraser[segHead] = isEraser
-            segTimestamp[segHead] = now
-            segHead = (segHead + 1) % MAX_SEGMENTS
+        } else {
+            segCount++
         }
+        segX1[segHead] = x1
+        segY1[segHead] = y1
+        segX2[segHead] = x2
+        segY2[segHead] = y2
+        segWidth[segHead] = strokeWidth
+        segColor[segHead] = color
+        segIsEraser[segHead] = isEraser
+        segTimestamp[segHead] = now
+        segHead = (segHead + 1) % MAX_SEGMENTS
     }
 
     /**
      * Called on each historical and current touch/stylus point from MainActivity.
+     * Pass `invalidateNow = false` for intermediate historical samples so a batch triggers one redraw.
      */
     fun processSample(
         pointerId: Int,
@@ -517,7 +574,8 @@ class InkOverlayView(context: Context) : View(context) {
         y: Float,
         pressure: Float,
         tiltX: Float,
-        tiltY: Float
+        tiltY: Float,
+        invalidateNow: Boolean = true
     ) {
         // Update sample rate
         sampleCountWindow++
@@ -533,7 +591,10 @@ class InkOverlayView(context: Context) : View(context) {
         lastTiltX = tiltX
         lastTiltY = tiltY
 
-        val p = if (pointerId in 0 until 16) cachedPointers[pointerId] else null
+        val isDownOrMove = action == MotionEvent.ACTION_DOWN ||
+            action == MotionEvent.ACTION_POINTER_DOWN ||
+            action == MotionEvent.ACTION_MOVE
+        val p = findPointerSlot(pointerId, allocate = isDownOrMove)
 
         when (action) {
             MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
@@ -569,6 +630,7 @@ class InkOverlayView(context: Context) : View(context) {
 
             MotionEvent.ACTION_UP, MotionEvent.ACTION_POINTER_UP, MotionEvent.ACTION_CANCEL -> {
                 p?.active = false
+                p?.pointerId = -1
                 isHovering = false
             }
 
@@ -583,7 +645,9 @@ class InkOverlayView(context: Context) : View(context) {
             }
         }
 
-        invalidate()
+        if (invalidateNow) {
+            invalidate()
+        }
     }
 
     private fun drawStrokeSegment(
@@ -904,8 +968,12 @@ class InkOverlayView(context: Context) : View(context) {
                     val fraction = (age.toFloat() / FADE_DURATION_MS).coerceIn(0f, 1f)
                     val alpha = ((1f - fraction) * 255).roundToInt().coerceIn(0, 255)
                     if (segIsEraser[idx]) {
-                        eraserPaint.strokeWidth = segWidth[idx]
-                        canvas.drawLine(segX1[idx], segY1[idx], segX2[idx], segY2[idx], eraserPaint)
+                        // PorterDuff.Mode.CLEAR renders black directly on a hardware-accelerated
+                        // View canvas; draw a soft fading coral eraser trail instead.
+                        fadePaint.color = colorEraser
+                        fadePaint.alpha = (alpha * 0.35f).roundToInt().coerceIn(0, 255)
+                        fadePaint.strokeWidth = segWidth[idx]
+                        canvas.drawLine(segX1[idx], segY1[idx], segX2[idx], segY2[idx], fadePaint)
                     } else {
                         fadePaint.color = segColor[idx]
                         fadePaint.alpha = alpha
@@ -967,6 +1035,7 @@ class InkOverlayView(context: Context) : View(context) {
         canvas.drawRoundRect(menuToggleBtnRect, 10f * density, 10f * density, menuPaint)
         canvas.drawRoundRect(menuToggleBtnRect, 10f * density, 10f * density, hudBorderPaint)
         val menuLabel = if (showMenu) "✕ CLOSE" else "⚙ MENU"
+        btnTextPaint.color = Color.WHITE
         btnTextPaint.textSize = 12f * density
         canvas.drawText(menuLabel, menuToggleBtnRect.centerX(), menuToggleBtnRect.centerY() + 5f * density, btnTextPaint)
 
@@ -1053,6 +1122,7 @@ class InkOverlayView(context: Context) : View(context) {
         val paint = if (isActive) btnActivePaint else btnPaint
         canvas.drawRoundRect(rect, 8f * density, 8f * density, paint)
         canvas.drawRoundRect(rect, 8f * density, 8f * density, hudBorderPaint)
+        btnTextPaint.color = Color.WHITE
         btnTextPaint.textSize = 11f * density
         canvas.drawText(text, rect.centerX(), rect.centerY() + 4.5f * density, btnTextPaint)
     }
@@ -1071,6 +1141,7 @@ class InkOverlayView(context: Context) : View(context) {
         canvas.drawRoundRect(sidebarToggleBtnRect, 8f * density, 8f * density, btnPaint)
         canvas.drawRoundRect(sidebarToggleBtnRect, 8f * density, 8f * density, hudBorderPaint)
         val toggleText = if (sidebarExpanded) "◀ KEYS" else "KEYS ▶"
+        btnTextPaint.color = Color.WHITE
         btnTextPaint.textSize = 12f * density
         canvas.drawText(toggleText, sidebarToggleBtnRect.centerX(), sidebarToggleBtnRect.centerY() + 5f * density, btnTextPaint)
 
@@ -1175,6 +1246,7 @@ class InkOverlayView(context: Context) : View(context) {
             MotionEvent.TOOL_TYPE_FINGER -> "FINGER (Multi-touch)"
             else -> "IDLE (Ready)"
         }
+        textBodyPaint.color = Color.rgb(200, 215, 230)
         textBodyPaint.textSize = 15f * density
         textAccentPaint.textSize = 15f * density
         canvas.drawText("TOOL: ", curX, curY, textBodyPaint)
@@ -1258,7 +1330,10 @@ class InkOverlayView(context: Context) : View(context) {
         modalCloseBtnRect.set(modalCardRect.right - 54f * density, modalCardRect.top + 8f * density, modalCardRect.right - 8f * density, modalCardRect.top + 54f * density)
         canvas.drawRoundRect(modalCloseBtnRect, 10f * density, 10f * density, btnPaint)
         canvas.drawRoundRect(modalCloseBtnRect, 10f * density, 10f * density, hudBorderPaint)
-        canvas.drawText("✕", modalCloseBtnRect.centerX(), modalCloseBtnRect.centerY() + 8f * density, btnTextPaint)
+        btnTextPaint.color = Color.WHITE
+        btnTextPaint.textSize = 16f * density
+        canvas.drawText("✕", modalCloseBtnRect.centerX(), modalCloseBtnRect.centerY() + 6f * density, btnTextPaint)
+        btnTextPaint.textSize = 12f * density
 
         // Title
         modalHeaderPaint.textSize = 20f * density
@@ -1475,61 +1550,58 @@ class InkOverlayView(context: Context) : View(context) {
 
         // App Brand Title
         landingTitlePaint.textSize = 34f * density
-        landingTitlePaint.color = Color.WHITE
-        landingTitlePaint.textAlign = Paint.Align.CENTER
-        landingTitlePaint.typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
         canvas.drawText("X D I S P L A Y", centerX, centerY + 30f * density, landingTitlePaint)
 
         // Subtitle
         landingSubPaint.textSize = 13f * density
         landingSubPaint.color = Color.rgb(0, 240, 255)
-        landingSubPaint.textAlign = Paint.Align.CENTER
-        landingSubPaint.typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
         canvas.drawText("LOW-LATENCY SECOND SCREEN", centerX, centerY + 52f * density, landingSubPaint)
 
         val isConnecting = (linkStatus == NativeEngine.STATUS_CONNECTING)
         val statusText = when {
             isConnecting -> "⚡ CONNECTING TO $targetLabel..."
+            isUsbTetherLink -> "🔌 WAITING FOR USB TETHERING..."
             isUsbLink -> "🔌 WAITING FOR USB CONNECTION"
             else -> "📡 RECONNECTING TO $targetLabel..."
         }
         landingStatusTextPaint.textSize = 12f * density
-        landingStatusTextPaint.typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
 
         // Connection status badge, sized to its text (long PC names) but never wider than the screen.
         val badgeW = (landingStatusTextPaint.measureText(statusText) + 52f * density)
             .coerceIn(220f * density, width - 32f * density)
         val badgeH = 38f * density
-        val badgeRect = RectF(centerX - badgeW / 2f, centerY + 78f * density, centerX + badgeW / 2f, centerY + 78f * density + badgeH)
+        landingBadgeRect.set(
+            centerX - badgeW / 2f,
+            centerY + 78f * density,
+            centerX + badgeW / 2f,
+            centerY + 78f * density + badgeH
+        )
         val statusColor = if (isConnecting) Color.rgb(255, 184, 0) else Color.rgb(0, 240, 255)
 
         landingBadgePaint.color = Color.argb(190, 18, 25, 38)
         landingBadgePaint.style = Paint.Style.FILL
-        canvas.drawRoundRect(badgeRect, 19f * density, 19f * density, landingBadgePaint)
+        canvas.drawRoundRect(landingBadgeRect, 19f * density, 19f * density, landingBadgePaint)
 
         landingBadgePaint.color = Color.argb(120, 0, 240, 255)
         landingBadgePaint.style = Paint.Style.STROKE
         landingBadgePaint.strokeWidth = 1.5f * density
-        canvas.drawRoundRect(badgeRect, 19f * density, 19f * density, landingBadgePaint)
+        canvas.drawRoundRect(landingBadgeRect, 19f * density, 19f * density, landingBadgePaint)
 
         // Status indicator dot
         landingBadgePaint.style = Paint.Style.FILL
         landingBadgePaint.color = statusColor
-        canvas.drawCircle(centerX - badgeW / 2f + 20f * density, badgeRect.centerY(), 5f * density, landingBadgePaint)
+        canvas.drawCircle(centerX - badgeW / 2f + 20f * density, landingBadgeRect.centerY(), 5f * density, landingBadgePaint)
 
-        landingStatusTextPaint.color = Color.WHITE
-        landingStatusTextPaint.textAlign = Paint.Align.LEFT
         canvas.save()
-        canvas.clipRect(badgeRect.left, badgeRect.top, badgeRect.right - 14f * density, badgeRect.bottom)
-        canvas.drawText(statusText, centerX - badgeW / 2f + 32f * density, badgeRect.centerY() + 4.5f * density, landingStatusTextPaint)
+        canvas.clipRect(landingBadgeRect.left, landingBadgeRect.top, landingBadgeRect.right - 14f * density, landingBadgeRect.bottom)
+        canvas.drawText(statusText, centerX - badgeW / 2f + 32f * density, landingBadgeRect.centerY() + 4.5f * density, landingStatusTextPaint)
         canvas.restore()
 
         // A new tablet on USB waits for the user to approve it at the PC.
         if (isConnecting && isUsbLink) {
             landingSubPaint.textSize = 11f * density
             landingSubPaint.color = Color.rgb(170, 185, 205)
-            landingSubPaint.textAlign = Paint.Align.CENTER
-            canvas.drawText("First time on this PC? Choose Yes in the prompt on the PC.", centerX, badgeRect.bottom + 18f * density, landingSubPaint)
+            canvas.drawText("First time on this PC? Choose Yes in the prompt on the PC.", centerX, landingBadgeRect.bottom + 18f * density, landingSubPaint)
         }
 
         // Device specifications footer chips
@@ -1540,15 +1612,13 @@ class InkOverlayView(context: Context) : View(context) {
 
         landingTipPaint.textSize = 11f * density
         landingTipPaint.color = Color.rgb(140, 165, 195)
-        landingTipPaint.textAlign = Paint.Align.CENTER
-        landingTipPaint.typeface = Typeface.create(Typeface.MONOSPACE, Typeface.NORMAL)
         canvas.drawText("$chipText1   ·   $chipText2   ·   $chipText3", centerX, chipY, landingTipPaint)
 
         landingTipPaint.color = Color.rgb(90, 115, 145)
-        val hint = if (isUsbLink) {
-            "Connect the USB cable to a Windows PC running XDisplay to start"
-        } else {
-            "Make sure XDisplay is running on the PC and this device is on the same Wi-Fi"
+        val hint = when {
+            isUsbTetherLink -> "Plug in the USB cable and turn on USB Tethering on this device"
+            isUsbLink -> "Connect the USB cable to a Windows PC running XDisplay to start"
+            else -> "Make sure XDisplay is running on the PC and this device is on the same Wi-Fi"
         }
         canvas.drawText(hint, centerX, chipY + 22f * density, landingTipPaint)
     }

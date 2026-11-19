@@ -8,8 +8,12 @@ use tokio::net::UdpSocket;
 use tracing::{debug, info, warn};
 use xdisplay_common::discovery::{AnnouncementKind, HostAnnouncement, DISCOVERY_PORT, PROBE};
 
+use super::usb_tether;
 use crate::shared::HostShared;
 
+/// How often we check for newly attached USB tethering interfaces.
+const INTERFACE_POLL_INTERVAL: Duration = Duration::from_millis(500);
+/// Steady-state interval between periodic UDP beacons.
 const BEACON_INTERVAL: Duration = Duration::from_secs(2);
 /// A tablet probes every 2 s; answering one address more often than this only helps a flood.
 const PROBE_REPLY_INTERVAL: Duration = Duration::from_millis(500);
@@ -76,7 +80,12 @@ pub fn lan_addresses() -> Vec<Ipv4Addr> {
     broadcast_targets().into_iter().map(|(ip, _)| ip).collect()
 }
 
-/// Spawns the UDP beacon and probe responder used to find this PC from the tablet over Wi-Fi.
+/// IPv4 addresses on active Android USB tethering (RNDIS / USB NCM) interfaces.
+pub fn usb_tether_addresses() -> Vec<Ipv4Addr> {
+    usb_tether::active_adapters().into_iter().map(|a| a.local_ip).collect()
+}
+
+/// Spawns the UDP beacon and probe responder used to find this PC over USB Tethering and Wi-Fi.
 pub fn spawn_discovery_server(tcp_port: u16, shared: Arc<HostShared>) {
     tokio::spawn(async move {
         let host_name = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "Windows PC".to_string());
@@ -95,35 +104,75 @@ pub fn spawn_discovery_server(tcp_port: u16, shared: Arc<HostShared>) {
                 match UdpSocket::bind(("0.0.0.0", 0)).await {
                     Ok(s) => Arc::new(s),
                     Err(e) => {
-                        warn!("Wi-Fi discovery disabled: no UDP socket available: {e}");
+                        warn!("Discovery disabled: no UDP socket available: {e}");
                         return;
                     }
                 }
             }
         };
         if let Err(e) = socket.set_broadcast(true) {
-            warn!("Wi-Fi discovery disabled: could not enable UDP broadcast: {e}");
+            warn!("Discovery disabled: could not enable UDP broadcast: {e}");
             return;
         }
-        info!("Wi-Fi discovery announcing '{host_name}' on UDP :{DISCOVERY_PORT}");
+        info!("Discovery announcing '{host_name}' on UDP :{DISCOVERY_PORT} (USB Tethering & Wi-Fi)");
 
         let beacon_socket = socket.clone();
         let beacon_shared = shared.clone();
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(BEACON_INTERVAL);
+            let mut tick = tokio::time::interval(INTERFACE_POLL_INTERVAL);
             let mut logged: Vec<Ipv4Addr> = Vec::new();
+            let mut logged_tethers: Vec<Ipv4Addr> = Vec::new();
+            let mut last_beacon: Option<Instant> = None;
             while beacon_shared.is_running.load(Ordering::Relaxed) {
                 tick.tick().await;
+                let tethers = usb_tether::query_active_adapters();
+                let tether_ips: Vec<Ipv4Addr> = tethers.iter().map(|a| a.local_ip).collect();
+                let tether_changed = tether_ips != logged_tethers;
+                if tether_changed {
+                    for a in &tethers {
+                        info!(
+                            "USB Tethering link ready ({}): {}:{} -> device {:?}",
+                            a.description, a.local_ip, tcp_port, a.gateway
+                        );
+                    }
+                    logged_tethers = tether_ips;
+                }
+
+                let periodic_due = last_beacon.is_none_or(|t| t.elapsed() >= BEACON_INTERVAL);
+                if !periodic_due && !tether_changed {
+                    continue;
+                }
+                last_beacon = Some(Instant::now());
+
                 let targets = broadcast_targets();
                 let addrs: Vec<_> = targets.iter().map(|t| t.0).collect();
                 if addrs != logged {
                     for ip in &addrs {
-                        info!("Tablet can reach this PC over Wi-Fi at {ip}:{tcp_port}");
+                        info!("Device can reach this PC at {ip}:{tcp_port}");
                     }
                     logged = addrs;
                 }
+
+                let mut dests: Vec<Ipv4Addr> = Vec::with_capacity(targets.len() + tethers.len() * 2);
+                // Direct unicast beacons to every USB tethering gateway (the Android device itself)
+                // first so OEMs that drop incoming broadcast UDP on rndis0/ncm0 still discover us immediately.
+                for a in &tethers {
+                    if let Some(gw) = a.gateway {
+                        if !dests.contains(&gw) {
+                            dests.push(gw);
+                        }
+                    }
+                    if !dests.contains(&a.broadcast) {
+                        dests.push(a.broadcast);
+                    }
+                }
                 for (_, bcast) in targets {
-                    let dest = SocketAddr::V4(SocketAddrV4::new(bcast, DISCOVERY_PORT));
+                    if !dests.contains(&bcast) {
+                        dests.push(bcast);
+                    }
+                }
+                for ip in dests {
+                    let dest = SocketAddr::V4(SocketAddrV4::new(ip, DISCOVERY_PORT));
                     if let Err(e) = beacon_socket.send_to(&beacon, dest).await {
                         debug!("beacon to {dest} failed: {e}");
                     }

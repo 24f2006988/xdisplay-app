@@ -1,19 +1,19 @@
 package com.xdisplay
 
 import android.app.Activity
-import android.content.BroadcastReceiver
-import android.content.IntentFilter
-import android.hardware.usb.UsbAccessory
-import android.hardware.usb.UsbManager
-import android.os.Build
 import android.app.AlertDialog
 import android.app.PendingIntent
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.hardware.usb.UsbAccessory
+import android.hardware.usb.UsbManager
 import android.net.wifi.WifiManager
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -32,22 +32,27 @@ import android.widget.TextView
 import androidx.core.content.ContextCompat
 
 /**
- * Connection picker: reconnect to the last PC, use the USB cable, pick a PC found on the Wi-Fi,
- * or type an address. PCs are discovered by the native layer; this screen only renders them.
+ * Connection picker: USB Tethering (works on every Android device with zero USB debugging),
+ * Wi-Fi auto-discovery, direct USB (ADB/AOA), or manual IP address.
  */
 class ConnectActivity : Activity() {
     private lateinit var store: ConnectionStore
     private lateinit var messageView: TextView
+    private lateinit var usbTetherHolder: LinearLayout
     private lateinit var hostList: LinearLayout
     private lateinit var lastButtonHolder: LinearLayout
     private lateinit var addressInput: EditText
 
     private val handler = Handler(Looper.getMainLooper())
     private var multicastLock: WifiManager.MulticastLock? = null
-    // null until the first render, so an empty list still draws the "searching" hint.
-    private var shownHosts: String? = null
+    // null until the first render, so an empty list still draws the initial hint.
+    private var shownRenderKey: String? = null
+    private var lastIfaceSpec: String? = null
     private var pinDialog: AlertDialog? = null
     private var usbAttachedReceiver: BroadcastReceiver? = null
+    /** Set when the user explicitly backed out of a session so auto-connect does not yank them back in. */
+    private var suppressAutoConnect = false
+    private var autoConnectTriggered = false
 
     private fun checkAndLaunchAoa(intentToCheck: Intent? = null): Boolean {
         val usbManager = getSystemService(Context.USB_SERVICE) as? UsbManager ?: return false
@@ -89,12 +94,25 @@ class ConnectActivity : Activity() {
 
     private val refreshRunnable = object : Runnable {
         override fun run() {
-            renderHosts(NativeEngine.getDiscoveredHosts())
+            val ifaces = NetworkUtils.activeInterfaces()
+            val spec = NetworkUtils.toNativeSpec(ifaces)
+            if (spec != lastIfaceSpec) {
+                lastIfaceSpec = spec
+                NativeEngine.setDiscoveryInterfaces(spec)
+            }
+            val tetherActive = NetworkUtils.isUsbTetheringActive(ifaces)
+            renderDiscovered(NativeEngine.getDiscoveredHosts(), tetherActive)
             handler.postDelayed(this, REFRESH_MS)
         }
     }
 
-    private data class Host(val ip: String, val port: Int, val name: String, val hostId: String)
+    private data class Host(
+        val ip: String,
+        val port: Int,
+        val name: String,
+        val hostId: String,
+        val isUsbTether: Boolean
+    )
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -117,14 +135,19 @@ class ConnectActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
+        autoConnectTriggered = false
+        if (checkAndLaunchAoa()) return
         // Some devices drop broadcast datagrams unless a multicast lock is held.
         val wifi = applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
         multicastLock = wifi?.createMulticastLock("xdisplay-discovery")?.apply {
             setReferenceCounted(false)
             acquire()
         }
+        val ifaces = NetworkUtils.activeInterfaces()
+        val spec = NetworkUtils.toNativeSpec(ifaces)
+        lastIfaceSpec = spec
+        NativeEngine.setDiscoveryInterfaces(spec)
         NativeEngine.startDiscovery()
-        if (checkAndLaunchAoa()) return
         val usbFilter = IntentFilter(ACTION_USB_PERMISSION)
         usbAttachedReceiver = object : BroadcastReceiver() {
             override fun onReceive(context: Context, intent: Intent) {
@@ -136,12 +159,13 @@ class ConnectActivity : Activity() {
         // Only our own PendingIntent sends this action, so the receiver is not exported.
         ContextCompat.registerReceiver(this, usbAttachedReceiver, usbFilter, ContextCompat.RECEIVER_NOT_EXPORTED)
         refreshLastTarget()
+        shownRenderKey = null
         handler.post(refreshRunnable)
     }
 
     override fun onPause() {
         super.onPause()
-        handler.removeCallbacks(refreshRunnable)
+        handler.removeCallbacksAndMessages(null)
         NativeEngine.stopDiscovery()
         multicastLock?.takeIf { it.isHeld }?.release()
         multicastLock = null
@@ -157,11 +181,24 @@ class ConnectActivity : Activity() {
         // Only MainActivity may tell us what to show or which host to ask a PIN for; this
         // activity is exported, so anything else could pop a PIN prompt for a fake PC.
         if (!InternalIntents.isInternal(intent)) return
+        if (intent.getBooleanExtra(EXTRA_NO_AUTO_CONNECT, false)) {
+            suppressAutoConnect = true
+            intent.removeExtra(EXTRA_NO_AUTO_CONNECT)
+        }
         val message = intent.getStringExtra(EXTRA_MESSAGE)
-        if (message != null) showMessage(message, error = intent.getBooleanExtra(EXTRA_ERROR, false))
+        if (message != null) {
+            suppressAutoConnect = true
+            showMessage(message, error = intent.getBooleanExtra(EXTRA_ERROR, false))
+        }
         if (intent.getBooleanExtra(EXTRA_NEED_PIN, false)) {
+            suppressAutoConnect = true
             val host = intent.getStringExtra(EXTRA_HOST) ?: return
-            val target = Target(host, intent.getIntExtra(EXTRA_PORT, Target.DEFAULT_PORT), intent.getStringExtra(EXTRA_NAME) ?: host)
+            val target = Target(
+                host,
+                intent.getIntExtra(EXTRA_PORT, Target.DEFAULT_PORT),
+                intent.getStringExtra(EXTRA_NAME) ?: host,
+                intent.getBooleanExtra(EXTRA_USB_TETHER, false)
+            )
             handler.post { askPin(target, intent.getStringExtra(EXTRA_HOST_ID)) }
         }
         intent.removeExtra(EXTRA_NEED_PIN)
@@ -173,6 +210,7 @@ class ConnectActivity : Activity() {
     // ---------------------------------------------------------------------------------------
 
     private fun connect(target: Target, hostId: String?) {
+        suppressAutoConnect = false
         val unpaired = !target.isUsb && hostId != null && !store.hasCredentialFor(hostId)
         if (unpaired) askPin(target, hostId) else launch(target, hostId, pin = "")
     }
@@ -186,10 +224,13 @@ class ConnectActivity : Activity() {
                 .putExtra(MainActivity.EXTRA_PORT, target.port)
                 .putExtra(MainActivity.EXTRA_NAME, target.name)
                 .putExtra(MainActivity.EXTRA_PIN, pin)
+                .putExtra(MainActivity.EXTRA_USB_TETHER, target.isUsbTether)
+                .putExtra(MainActivity.EXTRA_HOST_ID, hostId)
         )
     }
 
     private fun askPin(target: Target, hostId: String?) {
+        if (isFinishing || isDestroyed) return
         pinDialog?.dismiss()
         val input = EditText(this).apply {
             inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_VARIATION_PASSWORD
@@ -207,7 +248,7 @@ class ConnectActivity : Activity() {
         }
         pinDialog = AlertDialog.Builder(this)
             .setTitle("Pair with ${target.name}")
-            .setMessage("Open XDisplay on the PC and enter the PIN shown on its dashboard. You only need to do this once.")
+            .setMessage("Open XDisplay on the PC and enter the 6-digit PIN shown on its dashboard. You only need to do this once.")
             .setView(holder)
             .setPositiveButton("Pair") { _, _ -> launch(target, hostId, input.text.toString()) }
             .setNegativeButton("Cancel", null)
@@ -255,8 +296,13 @@ class ConnectActivity : Activity() {
     private fun refreshLastTarget() {
         lastButtonHolder.removeAllViews()
         val last = store.lastTarget ?: return
+        val subtitle = when {
+            last.isUsb -> "Direct USB (ADB / Accessory)"
+            last.isUsbTether -> "USB Tethering · ${last.host}"
+            else -> last.host
+        }
         lastButtonHolder.addView(
-            card("Reconnect to ${last.name}", if (last.isUsb) "USB cable" else last.host, accent = true) {
+            card("Reconnect to ${last.name}", subtitle, accent = false) {
                 connect(last, store.lastHostId)
             }
         )
@@ -264,17 +310,67 @@ class ConnectActivity : Activity() {
 
     private fun parseHosts(snapshot: String): List<Host> = snapshot.lineSequence().mapNotNull { line ->
         val parts = line.split('|')
-        if (parts.size != 4) return@mapNotNull null
-        Host(parts[0], parts[1].toIntOrNull() ?: return@mapNotNull null, parts[2], parts[3])
+        if (parts.size < 4) return@mapNotNull null
+        val port = parts[1].toIntOrNull() ?: return@mapNotNull null
+        val isUsbTether = parts.getOrNull(4) == "usb"
+        Host(parts[0], port, parts[2], parts[3], isUsbTether)
     }.toList()
 
     @Suppress("SetTextI18n")
-    private fun renderHosts(snapshot: String) {
-        if (snapshot == shownHosts) return
-        shownHosts = snapshot
-        hostList.removeAllViews()
+    private fun renderDiscovered(snapshot: String, tetherActive: Boolean) {
         val hosts = parseHosts(snapshot)
-        if (hosts.isEmpty()) {
+        val usbHosts = hosts.filter { it.isUsbTether }
+        val wifiHosts = hosts.filter { !it.isUsbTether }
+
+        // If a paired PC is discovered over USB Tethering, auto-connect immediately for zero-tap setup.
+        if (!suppressAutoConnect && !autoConnectTriggered && pinDialog?.isShowing != true) {
+            val pairedUsb = usbHosts.firstOrNull { store.hasCredentialFor(it.hostId) }
+            if (pairedUsb != null) {
+                autoConnectTriggered = true
+                launch(Target(pairedUsb.ip, pairedUsb.port, pairedUsb.name, isUsbTether = true), pairedUsb.hostId, pin = "")
+                return
+            }
+        }
+
+        val renderKey = "$tetherActive|$snapshot"
+        if (renderKey == shownRenderKey) return
+        shownRenderKey = renderKey
+
+        // 1. USB Tethering hero card(s)
+        usbTetherHolder.removeAllViews()
+        if (usbHosts.isNotEmpty()) {
+            for (host in usbHosts) {
+                val paired = store.hasCredentialFor(host.hostId)
+                val detail = "${host.ip}  ·  " + if (paired) "USB Tethering · paired (tap to connect)" else "USB Tethering · enter 6-digit PIN once"
+                usbTetherHolder.addView(card("⚡ ${host.name}", detail, accent = true) {
+                    connect(Target(host.ip, host.port, host.name, isUsbTether = true), host.hostId)
+                })
+            }
+        } else if (tetherActive) {
+            usbTetherHolder.addView(
+                card(
+                    "USB Tethering active — finding your PC…",
+                    "Make sure XDisplay is running on your Windows PC. Tap here to open Tethering settings.",
+                    accent = true
+                ) {
+                    NetworkUtils.openUsbTetheringSettings(this)
+                }
+            )
+        } else {
+            usbTetherHolder.addView(
+                card(
+                    "Turn on USB Tethering",
+                    "Plug in a USB cable, tap here, and toggle USB Tethering ON. Works on every Android device — no USB debugging needed.",
+                    accent = true
+                ) {
+                    NetworkUtils.openUsbTetheringSettings(this)
+                }
+            )
+        }
+
+        // 2. Wi-Fi discovered PCs
+        hostList.removeAllViews()
+        if (wifiHosts.isEmpty()) {
             hostList.addView(
                 TextView(this).apply {
                     text = "Searching for PCs on this Wi-Fi…\nMake sure XDisplay is running on the PC and both are on the same network."
@@ -283,14 +379,14 @@ class ConnectActivity : Activity() {
                     setPadding(dp(4), dp(8), dp(4), dp(8))
                 }
             )
-            return
-        }
-        for (host in hosts) {
-            val paired = store.hasCredentialFor(host.hostId)
-            val detail = "${host.ip}  ·  " + if (paired) "paired" else "PIN required"
-            hostList.addView(card(host.name, detail, accent = false) {
-                connect(Target(host.ip, host.port, host.name), host.hostId)
-            })
+        } else {
+            for (host in wifiHosts) {
+                val paired = store.hasCredentialFor(host.hostId)
+                val detail = "${host.ip}  ·  " + if (paired) "paired" else "PIN required"
+                hostList.addView(card(host.name, detail, accent = false) {
+                    connect(Target(host.ip, host.port, host.name, isUsbTether = false), host.hostId)
+                })
+            }
         }
     }
 
@@ -301,7 +397,7 @@ class ConnectActivity : Activity() {
         }
 
         root.addView(label("XDisplay", 30f, Color.WHITE, bold = true))
-        root.addView(label("Use this phone or tablet as a second screen and pen display", 15f, Color.rgb(140, 165, 195)))
+        root.addView(label("Use this phone or tablet as a low-latency second screen and pen display", 15f, Color.rgb(140, 165, 195)))
 
         messageView = label("", 14f, Color.rgb(255, 120, 120)).apply {
             visibility = View.GONE
@@ -309,17 +405,24 @@ class ConnectActivity : Activity() {
         }
         root.addView(messageView)
 
+        root.addView(section("USB Tethering (Recommended)"))
+        usbTetherHolder = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        root.addView(usbTetherHolder, spaced())
+
         lastButtonHolder = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        root.addView(lastButtonHolder, spaced())
+        root.addView(lastButtonHolder, spaced(top = 4))
 
-        root.addView(section("USB"))
-        root.addView(card("USB cable", "Fastest and needs no network. Plug in and run XDisplay on the PC.", accent = false) {
-            connect(Target.USB, hostId = null)
-        }, spaced())
-
-        root.addView(section("PCs on this Wi-Fi"))
+        root.addView(section("PCs on Wi-Fi"))
         hostList = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         root.addView(hostList, spaced())
+
+        root.addView(section("Other USB modes"))
+        root.addView(
+            card("Direct USB (ADB / Accessory)", "For devices with USB debugging enabled or legacy USB setup.", accent = false) {
+                connect(Target.USB, hostId = null)
+            },
+            spaced()
+        )
 
         root.addView(section("Enter an address"))
         addressInput = EditText(this).apply {
@@ -366,7 +469,7 @@ class ConnectActivity : Activity() {
             isFocusable = true
             setOnClickListener { onClick() }
             addView(label(title, 18f, Color.WHITE, bold = true))
-            addView(label(detail, 13f, Color.rgb(140, 165, 195)))
+            addView(label(detail, 13f, Color.rgb(165, 190, 215)))
             layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
                 .apply { bottomMargin = dp(10) }
         }
@@ -402,8 +505,10 @@ class ConnectActivity : Activity() {
         const val EXTRA_PORT = "port"
         const val EXTRA_NAME = "name"
         const val EXTRA_HOST_ID = "host_id"
+        const val EXTRA_USB_TETHER = "usb_tether"
+        const val EXTRA_NO_AUTO_CONNECT = "no_auto_connect"
 
-        private const val REFRESH_MS = 1000L
+        private const val REFRESH_MS = 500L
         private const val PIN_LENGTH = 6
         private val BG = Color.rgb(14, 18, 27)
         private val CARD = Color.rgb(22, 28, 42)

@@ -123,6 +123,20 @@ pub fn host_respond(password: &[u8], host_id: &HostId, client_msg: &[u8]) -> Res
 /// Shared secret from the key exchange. Equal on both sides only if the passwords matched.
 pub struct PakeKey(Vec<u8>);
 
+fn wipe_bytes(buf: &mut [u8]) {
+    for b in buf.iter_mut() {
+        // SAFETY: `b` is a valid, aligned, writable byte reference.
+        unsafe { std::ptr::write_volatile(b, 0) };
+    }
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+}
+
+impl Drop for PakeKey {
+    fn drop(&mut self) {
+        wipe_bytes(&mut self.0);
+    }
+}
+
 type HmacSha256 = Hmac<Sha256>;
 
 impl PakeKey {
@@ -154,11 +168,13 @@ impl PakeKey {
         let mut h2c = [0u8; 32];
         hk.expand(b"xdisplay client->host", &mut c2h).expect("32 bytes is a valid HKDF length");
         hk.expand(b"xdisplay host->client", &mut h2c).expect("32 bytes is a valid HKDF length");
-        let (send, recv) = match role {
-            Role::Client => (c2h, h2c),
-            Role::Host => (h2c, c2h),
+        let channel = match role {
+            Role::Client => (Sealer::new(&c2h), Opener::new(&h2c)),
+            Role::Host => (Sealer::new(&h2c), Opener::new(&c2h)),
         };
-        (Sealer::new(&send), Opener::new(&recv))
+        wipe_bytes(&mut c2h);
+        wipe_bytes(&mut h2c);
+        channel
     }
 }
 
@@ -180,16 +196,31 @@ impl Sealer {
         Self { cipher: ChaCha20Poly1305::new(Key::from_slice(key)), counter: 0 }
     }
 
-    /// Encrypts `payload` in place, appends the tag, and updates `header` (flag and length).
-    pub fn seal(&mut self, header: &mut PacketHeader, payload: &mut Vec<u8>) -> Result<(), CryptoError> {
+    /// Encrypts `payload` in place, updates `header` (flag and length), and returns the 16-byte
+    /// authentication tag without reallocating or copying `payload`.
+    pub fn seal_in_place(&mut self, header: &mut PacketHeader, payload: &mut [u8]) -> Result<[u8; TAG_LEN], CryptoError> {
+        let next_counter = self.counter.checked_add(1).ok_or(CryptoError::AuthenticationFailed)?;
+        let total_len = payload
+            .len()
+            .checked_add(TAG_LEN)
+            .and_then(|n| u32::try_from(n).ok())
+            .ok_or(CryptoError::InvalidPayload)?;
         header.flags |= flags::ENCRYPTED;
-        header.payload_len = (payload.len() + TAG_LEN) as u32;
+        header.payload_len = total_len;
         let aad = header.to_bytes();
         let tag = self
             .cipher
             .encrypt_in_place_detached(&nonce_for(self.counter), &aad, payload)
             .map_err(|_| CryptoError::AuthenticationFailed)?;
-        self.counter += 1;
+        self.counter = next_counter;
+        let mut out = [0u8; TAG_LEN];
+        out.copy_from_slice(&tag);
+        Ok(out)
+    }
+
+    /// Encrypts `payload` in place, appends the tag, and updates `header` (flag and length).
+    pub fn seal(&mut self, header: &mut PacketHeader, payload: &mut Vec<u8>) -> Result<(), CryptoError> {
+        let tag = self.seal_in_place(header, payload)?;
         payload.extend_from_slice(&tag);
         Ok(())
     }
@@ -206,19 +237,28 @@ impl Opener {
         Self { cipher: ChaCha20Poly1305::new(Key::from_slice(key)), counter: 0 }
     }
 
-    /// Verifies and decrypts `payload` (ciphertext + tag) in place, leaving the plaintext.
-    pub fn open(&mut self, header: &PacketHeader, payload: &mut Vec<u8>) -> Result<(), CryptoError> {
-        if header.flags & flags::ENCRYPTED == 0 || payload.len() < TAG_LEN {
+    /// Verifies and decrypts `buf` (ciphertext + trailing 16-byte tag) in place, returning the
+    /// plaintext byte length. Lets callers reuse a fixed-size receive buffer without zero-filling.
+    pub fn open_in_place(&mut self, header: &PacketHeader, buf: &mut [u8]) -> Result<usize, CryptoError> {
+        if header.flags & flags::ENCRYPTED == 0 || buf.len() < TAG_LEN {
             return Err(CryptoError::AuthenticationFailed);
         }
-        let split = payload.len() - TAG_LEN;
-        let tag = Tag::clone_from_slice(&payload[split..]);
-        payload.truncate(split);
+        let next_counter = self.counter.checked_add(1).ok_or(CryptoError::AuthenticationFailed)?;
+        let split = buf.len() - TAG_LEN;
+        let (ciphertext, tag_bytes) = buf.split_at_mut(split);
+        let tag = Tag::clone_from_slice(tag_bytes);
         let aad = header.to_bytes();
         self.cipher
-            .decrypt_in_place_detached(&nonce_for(self.counter), &aad, payload, &tag)
+            .decrypt_in_place_detached(&nonce_for(self.counter), &aad, ciphertext, &tag)
             .map_err(|_| CryptoError::AuthenticationFailed)?;
-        self.counter += 1;
+        self.counter = next_counter;
+        Ok(split)
+    }
+
+    /// Verifies and decrypts `payload` (ciphertext + tag) in place, leaving the plaintext.
+    pub fn open(&mut self, header: &PacketHeader, payload: &mut Vec<u8>) -> Result<(), CryptoError> {
+        let plain_len = self.open_in_place(header, payload)?;
+        payload.truncate(plain_len);
         Ok(())
     }
 }
@@ -336,5 +376,22 @@ mod tests {
             assert_eq!(pin.len(), 6);
             assert!(pin.bytes().all(|b| b.is_ascii_digit()));
         }
+    }
+
+    #[test]
+    fn in_place_slice_seal_and_open_roundtrip() {
+        let ((_, mut c_open), (mut h_seal, _)) = channel_pair();
+        let mut hdr = header(9);
+        let mut buf = [0u8; 64];
+        let msg = b"zero-copy frame bytes";
+        buf[..msg.len()].copy_from_slice(msg);
+        let tag = h_seal.seal_in_place(&mut hdr, &mut buf[..msg.len()]).unwrap();
+        buf[msg.len()..msg.len() + TAG_LEN].copy_from_slice(&tag);
+        assert_eq!(hdr.payload_len as usize, msg.len() + TAG_LEN);
+        assert_ne!(&buf[..msg.len()], msg);
+
+        let plain_len = c_open.open_in_place(&hdr, &mut buf[..msg.len() + TAG_LEN]).unwrap();
+        assert_eq!(plain_len, msg.len());
+        assert_eq!(&buf[..plain_len], msg);
     }
 }

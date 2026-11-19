@@ -8,7 +8,7 @@ use tracing::{error, info, warn};
 use xdisplay_common::protocol::VideoCodec;
 #[allow(unused_imports)]
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -98,7 +98,9 @@ impl Pacer {
     /// Monotonic time (ns) at which the frame captured at `pts_us` should be shown.
     fn present_at(&mut self, pts_us: i64, now_ns: i64) -> i64 {
         let observed = now_ns - pts_us * 1000;
-        if now_ns - self.window_start_ns >= PACER_WINDOW_NS {
+        if self.base_ns == i64::MAX {
+            self.window_start_ns = now_ns;
+        } else if now_ns - self.window_start_ns >= PACER_WINDOW_NS {
             if self.window_min_ns != i64::MAX {
                 self.base_ns = self.window_min_ns;
             }
@@ -131,6 +133,31 @@ pub fn raise_thread_priority(nice: i32) {
 
 #[cfg(not(target_os = "android"))]
 pub fn raise_thread_priority(_nice: i32) {}
+
+/// Probes once whether the Android device exposes a `video/hevc` MediaCodec decoder.
+/// Prevents advertising HEVC in `ClientHello` on devices that only have H.264 hardware decoding.
+pub fn supports_hardware_hevc() -> bool {
+    static SUPPORTED: OnceLock<bool> = OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        #[cfg(target_os = "android")]
+        unsafe {
+            let Ok(c_mime) = CString::new("video/hevc") else {
+                return false;
+            };
+            let codec = AMediaCodec_createDecoderByType(c_mime.as_ptr());
+            if codec.is_null() {
+                false
+            } else {
+                AMediaCodec_delete(codec);
+                true
+            }
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            true
+        }
+    })
+}
 
 /// Nice value for the receive and render threads (what Android calls URGENT_DISPLAY).
 pub const STREAM_THREAD_NICE: i32 = -8;
@@ -231,11 +258,17 @@ impl MediaCodecDecoder {
         }
 
         let format = AMediaFormat_new();
+        if format.is_null() {
+            AMediaCodec_delete(codec);
+            return Err(anyhow!("AMediaFormat_new returned null"));
+        }
         let key_mime = CString::new("mime")?;
         let key_width = CString::new("width")?;
         let key_height = CString::new("height")?;
         let key_low_latency = CString::new("low-latency")?;
         let key_qti_low_latency = CString::new("vendor.qti-ext-dec-low-latency.enable")?;
+        let key_rtc_low_latency = CString::new("vendor.rtc-ext-dec-low-latency.enable")?;
+        let key_vendor_low_latency = CString::new("vendor.low-latency.enable")?;
         let key_priority = CString::new("priority")?;
         let key_max_input = CString::new("max-input-size")?;
         let key_operating_rate = CString::new("operating-rate")?;
@@ -243,10 +276,11 @@ impl MediaCodecDecoder {
         AMediaFormat_setString(format, key_mime.as_ptr(), c_mime.as_ptr());
         AMediaFormat_setInt32(format, key_width.as_ptr(), width as i32);
         AMediaFormat_setInt32(format, key_height.as_ptr(), height as i32);
-        // Low-latency decoding hint (Android 11+)
+        // Low-latency decoding hints (Android 11+ standard, Qualcomm Snapdragon, MediaTek/vendor)
         AMediaFormat_setInt32(format, key_low_latency.as_ptr(), 1);
-        // Qualcomm Snapdragon Adreno low-latency hardware decoder hint
         AMediaFormat_setInt32(format, key_qti_low_latency.as_ptr(), 1);
+        AMediaFormat_setInt32(format, key_rtc_low_latency.as_ptr(), 1);
+        AMediaFormat_setInt32(format, key_vendor_low_latency.as_ptr(), 1);
         // Realtime priority
         AMediaFormat_setInt32(format, key_priority.as_ptr(), 0);
         // Without an operating rate the SoC decoder idles at a low clock (tuned for 30 fps video)
@@ -366,11 +400,21 @@ impl MediaCodecDecoder {
         self.pacer_reset.store(true, Ordering::Relaxed);
     }
 
+    /// Resets pacing and waits for a fresh IDR before feeding P-frames when a brand new
+    /// connection reuses an existing decoder instance, preventing cross-session reference smear.
+    pub fn reset_for_new_session(&mut self) {
+        self.awaiting_keyframe = true;
+        self.restart_pacing();
+    }
+
     #[cfg(target_os = "android")]
     unsafe fn feed_single_buffer(&mut self, chunk: &[u8], pts_us: u64, flags: u32) -> bool {
         let mut index = -1;
         // Retry for up to 30ms in 2ms increments to prevent dropping any frame
         for _ in 0..15 {
+            if !self.is_running.load(Ordering::Relaxed) {
+                return false;
+            }
             index = AMediaCodec_dequeueInputBuffer(self.codec, 2000);
             if index >= 0 {
                 break;

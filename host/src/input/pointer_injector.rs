@@ -5,7 +5,7 @@ use xdisplay_common::input::{actions, buttons, tool_types, PointerEvent};
 
 #[cfg(windows)]
 use windows::Win32::{
-    Foundation::POINT,
+    Foundation::{POINT, RECT},
     UI::{
         Controls::{
             CreateSyntheticPointerDevice, DestroySyntheticPointerDevice,
@@ -20,20 +20,24 @@ use windows::Win32::{
             },
             Pointer::{
                 InjectSyntheticPointerInput, POINTER_FLAGS, POINTER_INFO, POINTER_PEN_INFO,
-                POINTER_TOUCH_INFO, POINTER_FLAG_CANCELED, POINTER_FLAG_DOWN,
-                POINTER_FLAG_INCONTACT, POINTER_FLAG_INRANGE, POINTER_FLAG_PRIMARY, POINTER_FLAG_UP,
-                POINTER_FLAG_UPDATE,
+                POINTER_TOUCH_INFO, POINTER_FLAG_CANCELED, POINTER_FLAG_CONFIDENCE,
+                POINTER_FLAG_DOWN, POINTER_FLAG_INCONTACT, POINTER_FLAG_INRANGE,
+                POINTER_FLAG_PRIMARY, POINTER_FLAG_UP, POINTER_FLAG_UPDATE,
             },
         },
         WindowsAndMessaging::{
             GetSystemMetrics, POINTER_INPUT_TYPE, PT_PEN, PT_TOUCH, SetCursorPos,
             SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+            TOUCH_FLAG_NONE, TOUCH_MASK_CONTACTAREA,
         },
     },
 };
 
 /// Maximum simultaneous synthetic touch contacts.
 const MAX_TOUCH_CONTACTS: usize = 10;
+/// Half-width in virtual pixels of synthesized finger contact boxes for Windows touch targeting.
+#[cfg(windows)]
+const TOUCH_CONTACT_RADIUS_PX: i32 = 6;
 
 pub struct PointerInjector {
     #[cfg(windows)]
@@ -43,6 +47,9 @@ pub struct PointerInjector {
     /// Touch contacts currently down. Windows expects every active contact in each injected frame.
     #[cfg(windows)]
     touch_contacts: Vec<POINTER_TYPE_INFO>,
+    /// Tracks which active touch contact holds `POINTER_FLAG_PRIMARY`.
+    #[cfg(windows)]
+    touch_primary_id: Option<u32>,
     desktop_width: u32,
     desktop_height: u32,
     tablet_width: u32,
@@ -106,11 +113,17 @@ impl PointerInjector {
             } else {
                 warn!("Could not create synthetic pen device (requires interactive user session & Win8+)");
             }
+            if touch_device.is_some() {
+                info!("Windows Synthetic Touch Digitizer device initialized successfully");
+            } else {
+                warn!("Could not create synthetic touch device (requires interactive user session & Win8+)");
+            }
 
             Ok(Self {
                 pen_device,
                 touch_device,
                 touch_contacts: Vec::with_capacity(MAX_TOUCH_CONTACTS),
+                touch_primary_id: None,
                 desktop_width: screen_w,
                 desktop_height: screen_h,
                 tablet_width: default_width,
@@ -169,15 +182,64 @@ impl PointerInjector {
         } else {
             0.0
         };
-        let x = self.monitor_offset_x + (norm_x * self.desktop_width as f32).round() as i32;
-        let y = self.monitor_offset_y + (norm_y * self.desktop_height as f32).round() as i32;
-        (x, y)
+        // Clamp within [0, size - 1] so norm == 1.0 stays inside the virtual monitor bounds.
+        let max_dx = self.desktop_width.saturating_sub(1) as i32;
+        let max_dy = self.desktop_height.saturating_sub(1) as i32;
+        let dx = ((norm_x * self.desktop_width as f32).round() as i32).clamp(0, max_dx);
+        let dy = ((norm_y * self.desktop_height as f32).round() as i32).clamp(0, max_dy);
+        (self.monitor_offset_x + dx, self.monitor_offset_y + dy)
+    }
+
+    /// Maps Win32 virtual-desktop screen coordinates into the 0-based coordinate space expected by
+    /// `InjectSyntheticPointerInput`, where `(0, 0)` corresponds to `(vx, vy)`
+    /// (`SM_XVIRTUALSCREEN`, `SM_YVIRTUALSCREEN`). Without this translation, displays with negative
+    /// virtual offsets (e.g. vertically centered displays at `y = -90`) shift every contact by
+    /// `(vx, vy)` and wrap negative coordinates to the opposite edge of the desktop.
+    fn to_synthetic_point_in_bounds(
+        screen_x: i32,
+        screen_y: i32,
+        vx: i32,
+        vy: i32,
+        vw: i32,
+        vh: i32,
+    ) -> (i32, i32) {
+        let max_x = (vw - 1).max(0);
+        let max_y = (vh - 1).max(0);
+        ((screen_x - vx).clamp(0, max_x), (screen_y - vy).clamp(0, max_y))
+    }
+
+    #[cfg(windows)]
+    fn virtual_screen_bounds(&self) -> (i32, i32, i32, i32) {
+        unsafe {
+            let vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+            let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+            let vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+            let vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+            if vw > 0 && vh > 0 {
+                (vx, vy, vw, vh)
+            } else {
+                (0, 0, self.desktop_width.max(1) as i32, self.desktop_height.max(1) as i32)
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn to_synthetic_point(&self, screen_x: i32, screen_y: i32) -> (i32, i32) {
+        let (vx, vy, vw, vh) = self.virtual_screen_bounds();
+        Self::to_synthetic_point_in_bounds(screen_x, screen_y, vx, vy, vw, vh)
     }
 
     fn log_failure(&mut self, what: &str) {
         let due = self.last_failure_log.is_none_or(|t| t.elapsed().as_secs() >= 5);
         if due {
-            warn!("InjectSyntheticPointerInput failed for {} (further failures suppressed for 5 s)", what);
+            #[cfg(windows)]
+            let last_err = windows::core::Error::from_win32();
+            #[cfg(not(windows))]
+            let last_err = "non-windows";
+            warn!(
+                "InjectSyntheticPointerInput failed for {} ({:?}; further failures suppressed for 5 s)",
+                what, last_err
+            );
             self.last_failure_log = Some(Instant::now());
         }
     }
@@ -185,6 +247,8 @@ impl PointerInjector {
     /// Injects a batch from the tablet. Consecutive finger events sharing a timestamp are one
     /// digitizer frame and are injected together so multi-touch gestures stay coherent.
     pub fn process_batch(&mut self, events: &[PointerEvent]) {
+        #[cfg(windows)]
+        crate::shared::attach_to_default_desktop();
         let mut i = 0;
         while i < events.len() {
             let ev = &events[i];
@@ -197,7 +261,21 @@ impl PointerInjector {
                 {
                     j += 1;
                 }
-                self.inject_touch_frame(&events[i..j]);
+                if self.inject_touch_frame(&events[i..j]) {
+                    unsafe {
+                        self.release_fallback_mouse_buttons();
+                    }
+                    i = j;
+                    continue;
+                }
+                // Fall back to cursor + mouse emulation for single-contact gestures if synthetic
+                // touch injection is blocked (e.g. elevated target window).
+                if j == i + 1 {
+                    let (screen_x, screen_y) = self.to_screen(ev);
+                    unsafe {
+                        self.inject_mouse_fallback(ev, screen_x, screen_y);
+                    }
+                }
                 i = j;
                 continue;
             }
@@ -217,29 +295,40 @@ impl PointerInjector {
         }
         #[cfg(windows)]
         {
-            let ids: Vec<u32> = self
-                .touch_contacts
-                .iter()
-                .map(|c| unsafe { c.Anonymous.touchInfo.pointerInfo.pointerId })
-                .collect();
-            if !ids.is_empty() {
-                let cancels: Vec<PointerEvent> = ids
-                    .into_iter()
-                    .map(|id| PointerEvent::new_touch(id, actions::CANCEL, 0.0, 0.0, 0))
-                    .collect();
-                self.inject_touch_frame(&cancels);
+            if let Some(device) = self.touch_device {
+                if !self.touch_contacts.is_empty() {
+                    for c in self.touch_contacts.iter_mut() {
+                        let pi = unsafe { &mut c.Anonymous.touchInfo.pointerInfo };
+                        let primary_flag = if self.touch_primary_id == Some(pi.pointerId) {
+                            POINTER_FLAG_PRIMARY
+                        } else {
+                            windows::Win32::UI::Input::Pointer::POINTER_FLAG_NONE
+                        };
+                        pi.pointerFlags = POINTER_FLAG_UP | POINTER_FLAG_CANCELED | primary_flag;
+                    }
+                    let _ = unsafe { InjectSyntheticPointerInput(device, &self.touch_contacts) };
+                }
             }
+            self.touch_contacts.clear();
+            self.touch_primary_id = None;
             unsafe {
-                if self.is_right_down {
-                    mouse_event(MOUSEEVENTF_RIGHTUP, 0, 0, 0, 0);
-                }
-                if self.is_left_down {
-                    mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
-                }
+                self.release_fallback_mouse_buttons();
             }
         }
         self.is_left_down = false;
         self.is_right_down = false;
+    }
+
+    #[cfg(windows)]
+    unsafe fn release_fallback_mouse_buttons(&mut self) {
+        if self.is_right_down {
+            mouse_event(MOUSEEVENTF_RIGHTUP, 0, 0, 0, 0);
+            self.is_right_down = false;
+        }
+        if self.is_left_down {
+            mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
+            self.is_left_down = false;
+        }
     }
 
     pub fn process_event(&mut self, event: &PointerEvent) -> Result<()> {
@@ -263,85 +352,34 @@ impl PointerInjector {
                     0.0
                 };
                 let wheel_delta = (p * 120.0).round() as i32;
-                mouse_event(MOUSEEVENTF_WHEEL, 0, 0, wheel_delta, 0);
+                if wheel_delta != 0 {
+                    // Place the cursor under the scrolling gesture so Windows routes the wheel
+                    // message to the window on the tablet rather than the primary laptop monitor.
+                    let _ = SetCursorPos(screen_x, screen_y);
+                    mouse_event(MOUSEEVENTF_WHEEL, 0, 0, wheel_delta, 0);
+                }
                 return Ok(());
             }
 
             // Pen and touch go through Windows Ink synthetic injection only. Also emitting mouse
             // events doubles every sample (extra syscalls, and a second competing stroke source
             // that draws straight lines between strokes), so the mouse path is a fallback.
-            if (event.tool_type == tool_types::STYLUS || event.tool_type == tool_types::ERASER)
-                && self.pen_device.is_some()
-            {
-                if self.inject_pen(event, screen_x, screen_y) {
-                    return Ok(());
+            let synthetic_ok = match event.tool_type {
+                tool_types::STYLUS | tool_types::ERASER if self.pen_device.is_some() => {
+                    self.inject_pen(event, screen_x, screen_y)
                 }
-            } else if event.tool_type == tool_types::FINGER && self.touch_device.is_some() {
-                self.inject_touch_frame(std::slice::from_ref(event));
+                tool_types::FINGER if self.touch_device.is_some() => {
+                    self.inject_touch_frame(std::slice::from_ref(event))
+                }
+                _ => false,
+            };
+            if synthetic_ok {
+                self.release_fallback_mouse_buttons();
                 return Ok(());
             }
 
             // Fallback: system cursor + mouse emulation.
-            let vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
-            let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
-            let vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
-            let vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
-            let norm_x = if vw > 1 {
-                (((screen_x - vx) as i64 * 65535) / (vw - 1) as i64).clamp(0, 65535) as i32
-            } else {
-                0
-            };
-            let norm_y = if vh > 1 {
-                (((screen_y - vy) as i64 * 65535) / (vh - 1) as i64).clamp(0, 65535) as i32
-            } else {
-                0
-            };
-            let _ = SetCursorPos(screen_x, screen_y);
-            mouse_event(
-                MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
-                norm_x,
-                norm_y,
-                0,
-                0,
-            );
-
-            // 3. Universal mouse emulation: ensures MS Paint, Krita, Photoshop,
-            // and canvas draw immediate, smooth drag-strokes regardless of UIAccess/elevation!
-            let is_secondary = (event.buttons & buttons::SECONDARY_BARREL) != 0;
-            match event.action {
-                actions::DOWN => {
-                    if is_secondary {
-                        mouse_event(MOUSEEVENTF_RIGHTDOWN, 0, 0, 0, 0);
-                        self.is_right_down = true;
-                    } else {
-                        mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0);
-                        self.is_left_down = true;
-                    }
-                }
-                actions::MOVE => {
-                    let p = if event.pressure.is_finite() { event.pressure } else { 0.0 };
-                    if !self.is_left_down && !self.is_right_down && p > 0.01 {
-                        if is_secondary {
-                            mouse_event(MOUSEEVENTF_RIGHTDOWN, 0, 0, 0, 0);
-                            self.is_right_down = true;
-                        } else {
-                            mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0);
-                            self.is_left_down = true;
-                        }
-                    }
-                }
-                actions::UP | actions::CANCEL => {
-                    if self.is_right_down {
-                        mouse_event(MOUSEEVENTF_RIGHTUP, 0, 0, 0, 0);
-                        self.is_right_down = false;
-                    }
-                    if self.is_left_down {
-                        mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
-                        self.is_left_down = false;
-                    }
-                }
-                _ => {}
-            }
+            self.inject_mouse_fallback(event, screen_x, screen_y);
         }
 
         #[cfg(not(windows))]
@@ -351,8 +389,73 @@ impl PointerInjector {
     }
 
     #[cfg(windows)]
+    unsafe fn inject_mouse_fallback(&mut self, event: &PointerEvent, screen_x: i32, screen_y: i32) {
+        let vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        let vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        let vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+        let norm_x = if vw > 1 {
+            (((screen_x - vx) as i64 * 65535) / (vw - 1) as i64).clamp(0, 65535) as i32
+        } else {
+            0
+        };
+        let norm_y = if vh > 1 {
+            (((screen_y - vy) as i64 * 65535) / (vh - 1) as i64).clamp(0, 65535) as i32
+        } else {
+            0
+        };
+        let _ = SetCursorPos(screen_x, screen_y);
+        mouse_event(
+            MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+            norm_x,
+            norm_y,
+            0,
+            0,
+        );
+
+        // 3. Universal mouse emulation: ensures MS Paint, Krita, Photoshop,
+        // and canvas draw immediate, smooth drag-strokes regardless of UIAccess/elevation!
+        let is_secondary = (event.buttons & buttons::SECONDARY_BARREL) != 0;
+        match event.action {
+            actions::DOWN => {
+                if is_secondary {
+                    mouse_event(MOUSEEVENTF_RIGHTDOWN, 0, 0, 0, 0);
+                    self.is_right_down = true;
+                } else {
+                    mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0);
+                    self.is_left_down = true;
+                }
+            }
+            actions::MOVE => {
+                let p = if event.pressure.is_finite() { event.pressure } else { 0.0 };
+                if !self.is_left_down && !self.is_right_down && p > 0.01 {
+                    if is_secondary {
+                        mouse_event(MOUSEEVENTF_RIGHTDOWN, 0, 0, 0, 0);
+                        self.is_right_down = true;
+                    } else {
+                        mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0);
+                        self.is_left_down = true;
+                    }
+                }
+            }
+            actions::UP | actions::CANCEL => {
+                if self.is_right_down {
+                    mouse_event(MOUSEEVENTF_RIGHTUP, 0, 0, 0, 0);
+                    self.is_right_down = false;
+                }
+                if self.is_left_down {
+                    mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
+                    self.is_left_down = false;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[cfg(windows)]
     fn inject_pen(&mut self, event: &PointerEvent, screen_x: i32, screen_y: i32) -> bool {
         let Some(device) = self.pen_device else { return false; };
+        let (adj_x, adj_y) = self.to_synthetic_point(screen_x, screen_y);
 
         let mut pointer_flags = match event.action {
             actions::DOWN => POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT | POINTER_FLAG_DOWN,
@@ -406,7 +509,7 @@ impl PointerInjector {
                     pointerInfo: POINTER_INFO {
                         pointerType: PT_PEN,
                         pointerId: 0, // Must be 0 for maxCount = 1 device
-                        ptPixelLocation: POINT { x: screen_x, y: screen_y },
+                        ptPixelLocation: POINT { x: adj_x, y: adj_y },
                         pointerFlags: pointer_flags,
                         ..Default::default()
                     },
@@ -430,38 +533,119 @@ impl PointerInjector {
     }
 
     /// Applies one digitizer frame of finger events and injects all active contacts at once.
+    /// Returns false if synthetic touch injection failed so the caller can fall back if appropriate.
     #[cfg(windows)]
-    fn inject_touch_frame(&mut self, frame: &[PointerEvent]) {
-        let mut changed: Vec<u32> = Vec::with_capacity(frame.len());
+    fn inject_touch_frame(&mut self, frame: &[PointerEvent]) -> bool {
+        let bounds = self.virtual_screen_bounds();
+        let mut changed = [0u32; MAX_TOUCH_CONTACTS];
+        let mut changed_len = 0usize;
+        let mut ok = true;
         for ev in frame {
-            // The same finger twice in one frame: flush what we have and start a new frame.
-            if changed.contains(&ev.pointer_id) {
-                self.flush_touch(&changed);
-                changed.clear();
+            let already_active = self
+                .touch_contacts
+                .iter()
+                .any(|c| Self::contact_pointer_id(c) == ev.pointer_id);
+            // If DOWN arrives for a contact that never received UP, cancel the stale contact first
+            // so Windows treats the new DOWN as a fresh tap/stroke rather than merging it.
+            if ev.action == actions::DOWN && already_active {
+                if changed_len > 0 {
+                    if !self.flush_touch(&changed[..changed_len]) {
+                        ok = false;
+                    }
+                    changed_len = 0;
+                }
+                let cancel = PointerEvent::new_touch(
+                    ev.pointer_id,
+                    actions::CANCEL,
+                    ev.norm_x,
+                    ev.norm_y,
+                    ev.timestamp_us,
+                );
+                if self.update_contact_with_bounds(&cancel, bounds) && !self.flush_touch(&[ev.pointer_id]) {
+                    ok = false;
+                }
             }
-            if self.update_contact(ev) {
-                changed.push(ev.pointer_id);
+            // The same finger twice in one frame (or full stack buffer): flush and start a new frame.
+            if changed[..changed_len].contains(&ev.pointer_id) || changed_len == MAX_TOUCH_CONTACTS {
+                if !self.flush_touch(&changed[..changed_len]) {
+                    ok = false;
+                }
+                changed_len = 0;
+            }
+            if self.update_contact_with_bounds(ev, bounds) {
+                changed[changed_len] = ev.pointer_id;
+                changed_len += 1;
             }
         }
-        if !changed.is_empty() {
-            self.flush_touch(&changed);
+        if changed_len > 0 && !self.flush_touch(&changed[..changed_len]) {
+            ok = false;
+        }
+        ok
+    }
+
+    #[cfg(windows)]
+    fn build_touch_contact(
+        pointer_id: u32,
+        adj_x: i32,
+        adj_y: i32,
+        vw: i32,
+        vh: i32,
+        flags: POINTER_FLAGS,
+    ) -> POINTER_TYPE_INFO {
+        let max_x = (vw - 1).max(0);
+        let max_y = (vh - 1).max(0);
+        let rc = RECT {
+            left: (adj_x - TOUCH_CONTACT_RADIUS_PX).max(0),
+            top: (adj_y - TOUCH_CONTACT_RADIUS_PX).max(0),
+            right: (adj_x + TOUCH_CONTACT_RADIUS_PX).min(max_x),
+            bottom: (adj_y + TOUCH_CONTACT_RADIUS_PX).min(max_y),
+        };
+        POINTER_TYPE_INFO {
+            r#type: PT_TOUCH,
+            Anonymous: POINTER_TYPE_INFO_0 {
+                touchInfo: POINTER_TOUCH_INFO {
+                    pointerInfo: POINTER_INFO {
+                        pointerType: PT_TOUCH,
+                        pointerId: pointer_id,
+                        ptPixelLocation: POINT { x: adj_x, y: adj_y },
+                        pointerFlags: flags,
+                        ..Default::default()
+                    },
+                    touchFlags: TOUCH_FLAG_NONE,
+                    touchMask: TOUCH_MASK_CONTACTAREA,
+                    rcContact: rc,
+                    ..Default::default()
+                },
+            },
         }
     }
 
     /// Records the new state of one contact. Returns false if the event was ignored.
     #[cfg(windows)]
+    #[allow(dead_code)]
     fn update_contact(&mut self, ev: &PointerEvent) -> bool {
-        let (x, y) = self.to_screen(ev);
+        let bounds = self.virtual_screen_bounds();
+        self.update_contact_with_bounds(ev, bounds)
+    }
+
+    #[cfg(windows)]
+    fn update_contact_with_bounds(&mut self, ev: &PointerEvent, bounds: (i32, i32, i32, i32)) -> bool {
+        let (screen_x, screen_y) = self.to_screen(ev);
+        let (vx, vy, vw, vh) = bounds;
+        let (adj_x, adj_y) =
+            Self::to_synthetic_point_in_bounds(screen_x, screen_y, vx, vy, vw, vh);
         let existing = self
             .touch_contacts
             .iter()
-            .position(|c| unsafe { c.Anonymous.touchInfo.pointerInfo.pointerId } == ev.pointer_id);
+            .position(|c| Self::contact_pointer_id(c) == ev.pointer_id);
 
-        let flags = match (ev.action, existing.is_some()) {
+        let mut flags = match (ev.action, existing.is_some()) {
             (actions::DOWN, _) | (actions::MOVE, false) => {
-                POINTER_FLAG_DOWN | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT
+                POINTER_FLAG_DOWN | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT | POINTER_FLAG_CONFIDENCE
             }
-            (actions::MOVE, true) => POINTER_FLAG_UPDATE | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT,
+            (actions::MOVE, true) => {
+                POINTER_FLAG_UPDATE | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT | POINTER_FLAG_CONFIDENCE
+            }
             (actions::UP, true) => POINTER_FLAG_UP,
             (actions::CANCEL, true) => POINTER_FLAG_UP | POINTER_FLAG_CANCELED,
             // UP/CANCEL for an unknown contact, or hover events from a finger: nothing to do.
@@ -472,21 +656,14 @@ impl PointerInjector {
             return false;
         }
 
-        let info = POINTER_TYPE_INFO {
-            r#type: PT_TOUCH,
-            Anonymous: POINTER_TYPE_INFO_0 {
-                touchInfo: POINTER_TOUCH_INFO {
-                    pointerInfo: POINTER_INFO {
-                        pointerType: PT_TOUCH,
-                        pointerId: ev.pointer_id,
-                        ptPixelLocation: POINT { x, y },
-                        pointerFlags: flags,
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                },
-            },
-        };
+        if self.touch_primary_id.is_none() {
+            self.touch_primary_id = Some(ev.pointer_id);
+        }
+        if self.touch_primary_id == Some(ev.pointer_id) {
+            flags |= POINTER_FLAG_PRIMARY;
+        }
+
+        let info = Self::build_touch_contact(ev.pointer_id, adj_x, adj_y, vw, vh, flags);
         match existing {
             Some(i) => self.touch_contacts[i] = info,
             None => self.touch_contacts.push(info),
@@ -495,26 +672,69 @@ impl PointerInjector {
     }
 
     #[cfg(windows)]
-    fn flush_touch(&mut self, changed: &[u32]) {
-        let Some(device) = self.touch_device else { return };
+    fn flush_touch(&mut self, changed: &[u32]) -> bool {
+        if self.touch_contacts.is_empty() {
+            return true;
+        }
+        let Some(device) = self.touch_device else {
+            self.touch_contacts.clear();
+            self.touch_primary_id = None;
+            return false;
+        };
 
         // Contacts that did not move this frame are still down: report them as stationary updates.
         for c in self.touch_contacts.iter_mut() {
             let pi = unsafe { &mut c.Anonymous.touchInfo.pointerInfo };
             if !changed.contains(&pi.pointerId) {
-                pi.pointerFlags = POINTER_FLAG_UPDATE | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT;
+                let primary_flag = if self.touch_primary_id == Some(pi.pointerId) {
+                    POINTER_FLAG_PRIMARY
+                } else {
+                    windows::Win32::UI::Input::Pointer::POINTER_FLAG_NONE
+                };
+                pi.pointerFlags = POINTER_FLAG_UPDATE
+                    | POINTER_FLAG_INRANGE
+                    | POINTER_FLAG_INCONTACT
+                    | POINTER_FLAG_CONFIDENCE
+                    | primary_flag;
             }
         }
 
-        if unsafe { InjectSyntheticPointerInput(device, &self.touch_contacts) }.is_err() {
-            self.log_failure("touch");
-        }
+        let ok = match unsafe { InjectSyntheticPointerInput(device, &self.touch_contacts) } {
+            Ok(()) => {
+                self.complete_touch_frame();
+                true
+            }
+            Err(e) => {
+                self.log_failure(&format!("touch ({})", e));
+                self.touch_contacts.clear();
+                self.touch_primary_id = None;
+                false
+            }
+        };
+        ok
+    }
 
+    #[cfg(windows)]
+    fn contact_pointer_id(c: &POINTER_TYPE_INFO) -> u32 {
+        unsafe { c.Anonymous.touchInfo.pointerInfo.pointerId }
+    }
+
+    #[cfg(windows)]
+    fn complete_touch_frame(&mut self) {
         let lifted = |c: &POINTER_TYPE_INFO| {
             let f: POINTER_FLAGS = unsafe { c.Anonymous.touchInfo.pointerInfo.pointerFlags };
             (f & POINTER_FLAG_UP).0 != 0
         };
         self.touch_contacts.retain(|c| !lifted(c));
+        if let Some(pid) = self.touch_primary_id {
+            let still_active = self
+                .touch_contacts
+                .iter()
+                .any(|c| Self::contact_pointer_id(c) == pid);
+            if !still_active {
+                self.touch_primary_id = self.touch_contacts.first().map(Self::contact_pointer_id);
+            }
+        }
     }
 }
 
@@ -548,7 +768,72 @@ mod tests {
         let ev = PointerEvent::new_touch(0, actions::MOVE, 0.5, 0.25, 0);
         assert_eq!(inj.to_screen(&ev), (1920 + 900, 300));
         let corner = PointerEvent::new_touch(0, actions::MOVE, 1.0, 1.0, 0);
-        assert_eq!(inj.to_screen(&corner), (1920 + 1800, 1200));
+        assert_eq!(inj.to_screen(&corner), (1920 + 1799, 1199));
+    }
+
+    #[test]
+    fn translates_virtual_monitor_coords_with_negative_offsets() {
+        // Dual monitor: primary 1920x1080 at (0,0), virtual 3200x2136 at (1920,-90)
+        // Virtual screen bounds: origin (0, -90), size (5120, 2136).
+        let (vx, vy, vw, vh) = (0, -90, 5120, 2136);
+        assert_eq!(
+            PointerInjector::to_synthetic_point_in_bounds(1920, -90, vx, vy, vw, vh),
+            (1920, 0)
+        );
+        assert_eq!(
+            PointerInjector::to_synthetic_point_in_bounds(2653, -57, vx, vy, vw, vh),
+            (2653, 33)
+        );
+        assert_eq!(
+            PointerInjector::to_synthetic_point_in_bounds(5119, 2045, vx, vy, vw, vh),
+            (5119, 2135)
+        );
+        // Virtual monitor placed to the left of primary: (-3200, -90), total 5120x2136.
+        assert_eq!(
+            PointerInjector::to_synthetic_point_in_bounds(-3200, -90, -3200, -90, 5120, 2136),
+            (0, 0)
+        );
+        assert_eq!(
+            PointerInjector::to_synthetic_point_in_bounds(500, 500, -3200, -90, 5120, 2136),
+            (3700, 590)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn touch_primary_promotion_and_flags() {
+        let mut inj = injector();
+        let down0 = PointerEvent::new_touch(0, actions::DOWN, 0.2, 0.2, 100);
+        assert!(inj.update_contact(&down0));
+        assert_eq!(inj.touch_primary_id, Some(0));
+        let f0 = unsafe { inj.touch_contacts[0].Anonymous.touchInfo.pointerInfo.pointerFlags };
+        assert_ne!((f0 & POINTER_FLAG_PRIMARY).0, 0);
+        assert_ne!((f0 & POINTER_FLAG_CONFIDENCE).0, 0);
+        assert_eq!(unsafe { inj.touch_contacts[0].Anonymous.touchInfo.touchMask }, TOUCH_MASK_CONTACTAREA);
+
+        // Second contact must NOT steal PRIMARY while contact 0 is active.
+        let down1 = PointerEvent::new_touch(1, actions::DOWN, 0.6, 0.6, 200);
+        assert!(inj.update_contact(&down1));
+        assert_eq!(inj.touch_primary_id, Some(0));
+        let f1 = unsafe { inj.touch_contacts[1].Anonymous.touchInfo.pointerInfo.pointerFlags };
+        assert_eq!((f1 & POINTER_FLAG_PRIMARY).0, 0);
+        assert_ne!((f1 & POINTER_FLAG_CONFIDENCE).0, 0);
+
+        // Lifting contact 0 keeps PRIMARY on 0 for UP frame, then promotes remaining contact 1.
+        let up0 = PointerEvent::new_touch(0, actions::UP, 0.2, 0.2, 300);
+        assert!(inj.update_contact(&up0));
+        let f0_up = unsafe { inj.touch_contacts[0].Anonymous.touchInfo.pointerInfo.pointerFlags };
+        assert_ne!((f0_up & POINTER_FLAG_PRIMARY).0, 0);
+        inj.complete_touch_frame();
+        assert_eq!(inj.touch_contacts.len(), 1);
+        assert_eq!(inj.touch_primary_id, Some(1));
+
+        let move1 = PointerEvent::new_touch(1, actions::MOVE, 0.65, 0.65, 400);
+        assert!(inj.update_contact(&move1));
+        let f1_mv = unsafe { inj.touch_contacts[0].Anonymous.touchInfo.pointerInfo.pointerFlags };
+        assert_ne!((f1_mv & POINTER_FLAG_PRIMARY).0, 0);
+        inj.touch_contacts.clear();
+        inj.touch_primary_id = None;
     }
 
     #[test]
@@ -577,12 +862,24 @@ mod tests {
         let neg = PointerEvent::new_touch(0, actions::MOVE, -0.5, -2.0, 0);
         assert_eq!(inj.to_screen(&neg), (1920, 0));
 
-        // Excess coords clamp to 1.0
+        // Excess coords clamp to 1.0 (inside monitor rect)
         let excess = PointerEvent::new_touch(0, actions::MOVE, 1.5, 3.0, 0);
-        assert_eq!(inj.to_screen(&excess), (1920 + 1800, 1200));
+        assert_eq!(inj.to_screen(&excess), (1920 + 1799, 1199));
 
         // NaN coords clamp to 0.0
         let nan_ev = PointerEvent::new_touch(0, actions::MOVE, f32::NAN, f32::NAN, 0);
         assert_eq!(inj.to_screen(&nan_ev), (1920, 0));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn empty_touch_flush_is_safe_and_mouse_fallback_state_clears() {
+        let mut inj = injector();
+        assert!(inj.flush_touch(&[]));
+        inj.is_left_down = true;
+        inj.is_right_down = true;
+        unsafe { inj.release_fallback_mouse_buttons() };
+        assert!(!inj.is_left_down);
+        assert!(!inj.is_right_down);
     }
 }

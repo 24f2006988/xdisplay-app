@@ -28,7 +28,7 @@ use crate::capture::encoder::{
 };
 use crate::capture::rate_control::RateController;
 use crate::capture::virtual_display;
-use crate::shared::HostShared;
+use crate::shared::{CachedIdr, HostShared};
 use xdisplay_common::protocol::VideoCodec;
 
 #[derive(Clone, Debug)]
@@ -92,6 +92,7 @@ pub fn monitor_rect(hmonitor: usize, refresh_hz: u32) -> Option<ActiveDisplayInf
 }
 
 pub struct CachedGpu {
+    pub device_raw: usize,
     pub texture: SendCom<ID3D11Texture2D>,
     pub context: SendCom<ID3D11DeviceContext>,
 }
@@ -108,6 +109,9 @@ pub struct EncoderState {
     pub encoder: Option<Box<dyn VideoEncoder>>,
     pub encoder_size: (u32, u32),
     pub encoder_codec: Option<VideoCodec>,
+    /// Raw `ID3D11Device*` the GPU-input encoder is bound to (0 for CPU-input encoders).
+    /// Prevents cross-device texture copies after a WGC restart creates a fresh D3D11 device.
+    pub encoder_device: usize,
     /// Rate and bitrate the current encoder runs at (see `reconfigure`).
     pub encoder_fps: u32,
     pub encoder_bitrate: u32,
@@ -144,6 +148,7 @@ impl EncoderState {
             encoder: None,
             encoder_size: (0, 0),
             encoder_codec: None,
+            encoder_device: 0,
             encoder_fps: 0,
             encoder_bitrate: 0,
             gpu_input_failed: false,
@@ -236,26 +241,37 @@ impl EncoderState {
     pub fn ensure_encoder(
         &mut self,
         codec: VideoCodec,
-        device: Option<&ID3D11Device>,
-        width: u32,
-        height: u32,
+        device: Option<(&ID3D11Device, usize)>,
+        size: (u32, u32),
         fps: u32,
         bitrate: u32,
     ) -> bool {
-        if self.encoder.is_some() && self.encoder_size == (width, height) && self.encoder_codec == Some(codec) {
+        let (width, height) = size;
+        let device_raw = device.map_or(0, |(_, raw)| raw);
+        let same_device = self
+            .encoder
+            .as_ref()
+            .is_some_and(|e| !e.uses_gpu_input() || self.encoder_device == device_raw);
+        if self.encoder.is_some()
+            && self.encoder_size == size
+            && self.encoder_codec == Some(codec)
+            && same_device
+        {
             return true;
         }
         self.encoder = None;
+        self.encoder_device = 0;
         let dev = if self.gpu_input_failed {
             None
         } else {
-            device
+            device.map(|(d, _)| d)
         };
         match create_video_encoder_with_codec(codec, width, height, fps, bitrate, dev) {
             Ok(enc) => {
                 info!("Encoder for {:?} {}x{} @ {}Hz ({} kbps): {}", codec, width, height, fps, bitrate / 1000, enc.name());
+                self.encoder_device = if enc.uses_gpu_input() { device_raw } else { 0 };
                 self.encoder = Some(enc);
-                self.encoder_size = (width, height);
+                self.encoder_size = size;
                 self.encoder_codec = Some(codec);
                 self.encoder_fps = fps;
                 self.encoder_bitrate = bitrate;
@@ -274,6 +290,92 @@ impl EncoderState {
         }
     }
 
+    /// Drops GPU resources tied to a WGC session's D3D11 device (e.g. when WGC restarts).
+    pub fn invalidate_gpu_resources(&mut self) {
+        if self.encoder.as_ref().is_some_and(|e| e.uses_gpu_input()) {
+            self.encoder = None;
+            self.encoder_device = 0;
+        }
+        if matches!(self.cached_frame, Some(CachedFrame::Gpu(_))) {
+            self.cached_frame = None;
+        }
+    }
+
+    pub fn cache_gpu_frame(
+        &mut self,
+        device: &ID3D11Device,
+        device_raw: usize,
+        raw_tex: *mut std::ffi::c_void,
+        width: u32,
+        height: u32,
+    ) {
+        let src = unsafe { ID3D11Texture2D::from_raw_borrowed(&raw_tex) };
+        let Some(src_tex) = src else { return };
+        let needs_new_tex = match &self.cached_frame {
+            Some(CachedFrame::Gpu(g)) => self.cached_size != (width, height) || g.device_raw != device_raw,
+            _ => true,
+        };
+        if needs_new_tex {
+            let desc = D3D11_TEXTURE2D_DESC {
+                Width: width,
+                Height: height,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
+                CPUAccessFlags: 0,
+                MiscFlags: 0,
+            };
+            let mut tex = None;
+            if unsafe { device.CreateTexture2D(&desc, None, Some(&mut tex)) }.is_ok() {
+                if let Some(t) = tex {
+                    if let Ok(ctx) = unsafe { device.GetImmediateContext() } {
+                        self.cached_frame = Some(CachedFrame::Gpu(CachedGpu {
+                            device_raw,
+                            texture: SendCom(t),
+                            context: SendCom(ctx),
+                        }));
+                        self.cached_size = (width, height);
+                    }
+                }
+            }
+        }
+        if let Some(CachedFrame::Gpu(cached_gpu)) = &self.cached_frame {
+            let region = D3D11_BOX { left: 0, top: 0, front: 0, right: width, bottom: height, back: 1 };
+            unsafe {
+                cached_gpu.context.0.CopySubresourceRegion(
+                    &cached_gpu.texture.0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    src_tex,
+                    0,
+                    Some(&region),
+                );
+            }
+        }
+    }
+
+    pub fn cache_cpu_frame(&mut self, raw_buf: &[u8], row_pitch: usize, width: u32, height: u32) {
+        match &mut self.cached_frame {
+            Some(CachedFrame::Cpu { buffer: b, row_pitch: rp }) => {
+                b.resize(raw_buf.len(), 0);
+                b.copy_from_slice(raw_buf);
+                *rp = row_pitch;
+            }
+            _ => {
+                self.cached_frame = Some(CachedFrame::Cpu {
+                    buffer: raw_buf.to_vec(),
+                    row_pitch,
+                });
+            }
+        }
+        self.cached_size = (width, height);
+    }
+
     /// Applies changed stream settings. A bitrate change is made in place: rebuilding the
     /// encoder restarts the stream with a keyframe several times a P-frame's size, a visible
     /// hitch that adaptive bitrate would otherwise cause every time it steps.
@@ -281,13 +383,16 @@ impl EncoderState {
         let Some(enc) = self.encoder.as_mut() else { return };
         if fps != self.encoder_fps {
             self.encoder = None;
+            self.encoder_device = 0;
         } else if bitrate != self.wire_bitrate {
             // `pace_bitrate` re-applies the frame-rate scaling from the next frame on.
             if enc.set_bitrate(bitrate) {
                 self.encoder_bitrate = bitrate;
                 self.wire_bitrate = bitrate;
+                self.budget_changed_at = Instant::now();
             } else {
                 self.encoder = None;
+                self.encoder_device = 0;
             }
         }
     }
@@ -319,20 +424,27 @@ impl EncoderState {
             self.last_config.extend_from_slice(&data[..end]);
         }
 
-        let data = Arc::new(data);
+        let (data, is_config) = if info.has_idr && !info.has_config && !self.last_config.is_empty() {
+            // Some hardware encoders omit VPS/SPS/PPS on forced mid-stream IDRs; prepend the cached
+            // parameter sets so a fresh decoder on the tablet can always synchronize immediately.
+            (Arc::new([self.last_config.as_slice(), data.as_slice()].concat()), true)
+        } else {
+            (Arc::new(data), info.has_config)
+        };
+
         if info.has_idr {
-            let cached = if info.has_config || self.last_config.is_empty() {
-                data.clone()
-            } else {
-                Arc::new([self.last_config.as_slice(), data.as_slice()].concat())
-            };
             if let Ok(mut guard) = shared.latest_idr.lock() {
-                *guard = Some(VideoPacket {
-                    data: cached,
-                    pts_us,
-                    is_keyframe: true,
-                    is_config: true,
-                    captured_at,
+                *guard = Some(CachedIdr {
+                    packet: VideoPacket {
+                        data: data.clone(),
+                        pts_us,
+                        is_keyframe: true,
+                        is_config,
+                        captured_at,
+                    },
+                    codec,
+                    width: self.encoder_size.0,
+                    height: self.encoder_size.1,
                 });
             }
         }
@@ -348,7 +460,7 @@ impl EncoderState {
             data,
             pts_us,
             is_keyframe: info.has_idr,
-            is_config: info.has_config,
+            is_config,
             captured_at,
         };
         match video_tx.try_send(pkt) {
@@ -547,11 +659,13 @@ impl GraphicsCaptureApiHandler for ScreenCaptureHandler {
         }
 
         let captured_at = Instant::now();
-        let device_opt = unsafe { device_from_raw(com_raw(frame.device())) };
+        let raw_dev = com_raw(frame.device());
+        let device_raw = raw_dev as usize;
+        let device_opt = unsafe { device_from_raw(raw_dev) };
 
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let target_fps = self.shared.target_fps.load(Ordering::Relaxed).max(30);
-        let target_bitrate = self.shared.target_bitrate_kbps.load(Ordering::Relaxed) * 1000;
+        let target_bitrate = self.shared.target_bitrate_kbps.load(Ordering::Relaxed).saturating_mul(1000);
         let bitrate = if target_bitrate > 0 {
             target_bitrate
         } else {
@@ -561,101 +675,39 @@ impl GraphicsCaptureApiHandler for ScreenCaptureHandler {
             state.reconfigure(target_fps, bitrate);
         }
         let active_codec = *self.shared.active_codec.lock().unwrap_or_else(|e| e.into_inner());
-        if !state.ensure_encoder(active_codec, device_opt.as_ref(), width, height, target_fps, bitrate) {
+        if !state.ensure_encoder(
+            active_codec,
+            device_opt.as_ref().map(|d| (d, device_raw)),
+            (width, height),
+            target_fps,
+            bitrate,
+        ) {
             return Ok(());
         }
 
-        // Cache the incoming frame so an idle desktop can re-encode an immediate IDR on request
         let gpu = state.encoder.as_ref().is_some_and(|e| e.uses_gpu_input());
-        if gpu {
-            if let Some(device) = device_opt.as_ref() {
-                let raw_tex = com_raw(frame.as_raw_texture());
-                let src = unsafe { ID3D11Texture2D::from_raw_borrowed(&raw_tex) };
-                if let Some(src_tex) = src {
-                    let needs_new_tex = match &state.cached_frame {
-                        Some(CachedFrame::Gpu(_)) => state.cached_size != (width, height),
-                        _ => true,
-                    };
-                    if needs_new_tex {
-                        let desc = D3D11_TEXTURE2D_DESC {
-                            Width: width,
-                            Height: height,
-                            MipLevels: 1,
-                            ArraySize: 1,
-                            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-                            Usage: D3D11_USAGE_DEFAULT,
-                            BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
-                            CPUAccessFlags: 0,
-                            MiscFlags: 0,
-                        };
-                        let mut tex = None;
-                        if unsafe { device.CreateTexture2D(&desc, None, Some(&mut tex)) }.is_ok() {
-                            if let Some(t) = tex {
-                                if let Ok(ctx) = unsafe { device.GetImmediateContext() } {
-                                    state.cached_frame = Some(CachedFrame::Gpu(CachedGpu {
-                                        texture: SendCom(t),
-                                        context: SendCom(ctx),
-                                    }));
-                                    state.cached_size = (width, height);
-                                }
-                            }
-                        }
-                    }
-                    if let Some(CachedFrame::Gpu(cached_gpu)) = &state.cached_frame {
-                        let region = D3D11_BOX { left: 0, top: 0, front: 0, right: width, bottom: height, back: 1 };
-                        unsafe {
-                            cached_gpu.context.0.CopySubresourceRegion(
-                                &cached_gpu.texture.0,
-                                0,
-                                0,
-                                0,
-                                0,
-                                src_tex,
-                                0,
-                                Some(&region),
-                            );
-                        }
-                    }
-                }
-            }
-        } else {
-            if let Ok(mut buffer) = frame.buffer() {
-                let row_pitch = buffer.row_pitch() as usize;
-                let raw_buf = buffer.as_raw_buffer();
-                match &mut state.cached_frame {
-                    Some(CachedFrame::Cpu { buffer: b, row_pitch: rp }) => {
-                        b.resize(raw_buf.len(), 0);
-                        b.copy_from_slice(raw_buf);
-                        *rp = row_pitch;
-                    }
-                    _ => {
-                        state.cached_frame = Some(CachedFrame::Cpu {
-                            buffer: raw_buf.to_vec(),
-                            row_pitch,
-                        });
-                    }
-                }
-                state.cached_size = (width, height);
-            }
-        }
-        state.last_frame_at = Instant::now();
+        state.last_frame_at = captured_at;
 
         // While no client is connected, keep the cached frame fresh but avoid wasteful encoding.
         if !self.shared.client_connected.load(Ordering::Relaxed) {
+            Self::update_cache(&mut state, frame, device_opt.as_ref(), device_raw, gpu, width, height);
             return Ok(());
         }
 
         // A forced keyframe is never skipped; otherwise hold the encode rate to the tablet's.
         let wants_idr = self.shared.request_idr.load(Ordering::Relaxed);
         if !wants_idr && !state.admit_frame(captured_at, frame_interval(&self.shared)) {
+            Self::update_cache(&mut state, frame, device_opt.as_ref(), device_raw, gpu, width, height);
             return Ok(());
         }
 
         // The link is backed up: skip this frame before encoding it. Nothing has entered the
         // encoder's reference chain, so no keyframe is needed afterwards (dropping an encoded
-        // P-frame would force a large IDR, which only deepens the backlog).
+        // P-frame would force a large IDR, which only deepens the backlog). Mark flush_pending
+        // so the idle pump delivers this last frame once the link clears.
         if self.video_tx.capacity() == 0 {
+            state.flush_pending = true;
+            Self::update_cache(&mut state, frame, device_opt.as_ref(), device_raw, gpu, width, height);
             self.shared.stats.record_drop();
             state.note_congestion(&self.shared);
             return Ok(());
@@ -668,18 +720,24 @@ impl GraphicsCaptureApiHandler for ScreenCaptureHandler {
             encoder.force_intra_frame();
         }
 
-        let result = if gpu {
-            let texture = com_raw(frame.as_raw_texture());
+        // Encode and publish to the wire *before* updating the idle cache, so the transport
+        // task begins transmitting immediately in parallel; on the CPU path also avoid a second
+        // `frame.buffer()` staging map by caching from the same mapped buffer.
+        let raw_tex = if gpu { Some(com_raw(frame.as_raw_texture())) } else { None };
+        let mut cpu_buffer = None;
+        let result = if let Some(texture) = raw_tex {
             encoder.encode(FrameInput::Gpu { texture }, width, height, pts_us)
         } else {
             let mut buffer = frame.buffer()?;
             let row_pitch = buffer.row_pitch() as usize;
-            encoder.encode(
+            let res = encoder.encode(
                 FrameInput::Cpu { data: buffer.as_raw_buffer(), row_pitch },
                 width,
                 height,
                 pts_us,
-            )
+            );
+            cpu_buffer = Some((buffer, row_pitch));
+            res
         };
         state.last_submitted = Some((pts_us, captured_at));
 
@@ -689,6 +747,7 @@ impl GraphicsCaptureApiHandler for ScreenCaptureHandler {
                 warn!("GPU-input encoding failed ({:#}); switching to system-memory input", e);
                 state.gpu_input_failed = true;
                 state.encoder = None;
+                state.encoder_device = 0;
                 self.shared.request_idr.store(true, Ordering::Relaxed);
                 return Ok(());
             }
@@ -701,6 +760,7 @@ impl GraphicsCaptureApiHandler for ScreenCaptureHandler {
                 {
                     warn!("DXGI device removed/reset detected ({:#}); invalidating encoder and cached textures for rebuild", e);
                     state.encoder = None;
+                    state.encoder_device = 0;
                     state.cached_frame = None;
                     self.shared.request_idr.store(true, Ordering::Relaxed);
                 } else {
@@ -715,7 +775,36 @@ impl GraphicsCaptureApiHandler for ScreenCaptureHandler {
             state.packets_from_encoder += 1;
             state.publish(&self.video_tx, &self.shared, data, pts_us, captured_at);
         }
+
+        if let Some(texture) = raw_tex {
+            if let Some(device) = device_opt.as_ref() {
+                state.cache_gpu_frame(device, device_raw, texture, width, height);
+            }
+        } else if let Some((mut buffer, row_pitch)) = cpu_buffer {
+            state.cache_cpu_frame(buffer.as_raw_buffer(), row_pitch, width, height);
+        }
         Ok(())
+    }
+}
+
+impl ScreenCaptureHandler {
+    fn update_cache(
+        state: &mut EncoderState,
+        frame: &mut Frame,
+        device_opt: Option<&ID3D11Device>,
+        device_raw: usize,
+        gpu: bool,
+        width: u32,
+        height: u32,
+    ) {
+        if gpu {
+            if let Some(device) = device_opt {
+                state.cache_gpu_frame(device, device_raw, com_raw(frame.as_raw_texture()), width, height);
+            }
+        } else if let Ok(mut buffer) = frame.buffer() {
+            let row_pitch = buffer.row_pitch() as usize;
+            state.cache_cpu_frame(buffer.as_raw_buffer(), row_pitch, width, height);
+        }
     }
 }
 
@@ -799,21 +888,22 @@ pub fn start_wgc_capture(video_tx: Sender<VideoPacket>, shared: Arc<HostShared>)
                     Err(std::sync::TryLockError::Poisoned(_)) => break,
                 };
                 state.drain_encoder(&pump_video_tx, &pump_shared);
+                if pump_video_tx.capacity() == 0 {
+                    continue;
+                }
                 if want_idr {
                     // A client is waiting for a keyframe while the desktop is static.
-                    if state.last_frame_at.elapsed() >= Duration::from_millis(50)
+                    if state.last_frame_at.elapsed() >= Duration::from_millis(25)
                         && state.encode_cached(&pump_video_tx, &pump_shared, true)
                     {
                         pump_shared.request_idr.store(false, Ordering::Relaxed);
                     }
-                } else if state.flush_pending
-                    && Instant::now() >= state.next_due
-                    && state.last_frame_at.elapsed() >= frame_interval(&pump_shared)
-                {
-                    // The rate cap skipped the newest frame and the source then went quiet, so
-                    // nothing else will carry that last change to the tablet.
-                    state.encode_cached(&pump_video_tx, &pump_shared, false);
-                    state.flush_pending = false;
+                } else if state.flush_pending && Instant::now() >= state.next_due {
+                    // The rate cap or transient backpressure skipped the newest frame and the
+                    // source then went quiet; deliver that last change right at its scheduled slot.
+                    if state.encode_cached(&pump_video_tx, &pump_shared, false) {
+                        state.flush_pending = false;
+                    }
                 }
             }
         })
@@ -826,6 +916,7 @@ pub fn start_wgc_capture(video_tx: Sender<VideoPacket>, shared: Arc<HostShared>)
     thread::Builder::new()
         .name("xdisplay-wgc-capture".into())
         .spawn(move || {
+            crate::shared::raise_thread_priority();
             while cap_shared.is_running.load(Ordering::Relaxed) {
                 // With no tablet the virtual monitor is detached; never fall back to another one.
                 if virtual_display::is_detached() && !cap_shared.client_connected.load(Ordering::Relaxed) {
@@ -890,6 +981,11 @@ pub fn start_wgc_capture(video_tx: Sender<VideoPacket>, shared: Arc<HostShared>)
 
                 if let Err(e) = result {
                     warn!("WGC capture session ended: {:?}", e);
+                }
+
+                // Release GPU encoder/cached textures bound to the ended session's D3D11 device.
+                if let Ok(mut state) = cap_state.lock() {
+                    state.invalidate_gpu_resources();
                 }
 
                 if cap_shared.is_running.load(Ordering::Relaxed) && !virtual_display::is_detached() {

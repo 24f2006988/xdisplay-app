@@ -195,11 +195,21 @@ pub extern "system" fn Java_com_xdisplay_NativeEngine_startDiscovery(_env: JNIEn
 }
 
 #[no_mangle]
+pub extern "system" fn Java_com_xdisplay_NativeEngine_setDiscoveryInterfaces(
+    mut env: JNIEnv,
+    _class: JClass,
+    spec: JString,
+) {
+    let spec = jstring_or_empty(&mut env, &spec);
+    get_discovery().set_interfaces(&spec);
+}
+
+#[no_mangle]
 pub extern "system" fn Java_com_xdisplay_NativeEngine_stopDiscovery(_env: JNIEnv, _class: JClass) {
     get_discovery().stop();
 }
 
-/// Hosts currently announcing themselves, one `ip|port|name|host_id_hex` per line.
+/// Hosts currently announcing themselves, one `ip|port|name|host_id_hex|usb|wifi` per line.
 #[no_mangle]
 pub extern "system" fn Java_com_xdisplay_NativeEngine_getDiscoveredHosts<'a>(
     env: JNIEnv<'a>,
@@ -320,6 +330,17 @@ pub extern "system" fn Java_com_xdisplay_NativeEngine_sendScrollEvent(
     delta_y: jfloat,
 ) {
     get_client().queue_scroll_event(delta_y);
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_xdisplay_NativeEngine_sendScrollEventAt(
+    _env: JNIEnv,
+    _class: JClass,
+    norm_x: jfloat,
+    norm_y: jfloat,
+    delta_y: jfloat,
+) {
+    get_client().queue_scroll_event_at(norm_x, norm_y, delta_y);
 }
 
 #[no_mangle]

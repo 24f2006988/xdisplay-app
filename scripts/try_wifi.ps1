@@ -30,10 +30,10 @@ $port = ($listen | Select-Object -First 1).LocalPort
 Step ($null -ne $port) "XDisplay host listening on TCP $port"
 
 # 2. Firewall rules
-$rules = Get-NetFirewallRule -DisplayName "XDisplay Host (Wi-Fi*" -ErrorAction SilentlyContinue | Where-Object Enabled -eq True
-Step ($rules.Count -ge 2) "Firewall rules for Wi-Fi present ($($rules.Count) of 2)"
+$rules = @(Get-NetFirewallRule -DisplayName "XDisplay Host (*" -ErrorAction SilentlyContinue | Where-Object Enabled -eq True)
+Step ($rules.Count -ge 2) "Firewall rules for USB Tethering / Wi-Fi present ($($rules.Count) rules)"
 if ($rules.Count -lt 2) {
-    Write-Host "         Run once as administrator:  powershell -ExecutionPolicy Bypass -File `"$repo\scripts\setup_wifi_firewall.ps1`"" -ForegroundColor Yellow
+    Write-Host "         Run once as administrator:  powershell -ExecutionPolicy Bypass -File `"$repo\scripts\setup_usb_tethering.ps1`"" -ForegroundColor Yellow
 }
 
 # 3. Which network the tablet must be on, and whether Windows trusts it

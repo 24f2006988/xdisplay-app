@@ -54,9 +54,10 @@ object NativeEngine {
     external fun takeNewCredential(): String
 
     external fun startDiscovery()
+    external fun setDiscoveryInterfaces(spec: String)
     external fun stopDiscovery()
 
-    /** Hosts currently announcing themselves: one `ip|port|name|hostIdHex` per line. */
+    /** Hosts currently announcing themselves: one `ip|port|name|hostIdHex|usb|wifi` per line. */
     external fun getDiscoveredHosts(): String
 
     external fun getSentPacketsCount(): Long
@@ -112,6 +113,12 @@ object NativeEngine {
     )
 
     external fun sendScrollEvent(
+        deltaY: Float
+    )
+
+    external fun sendScrollEventAt(
+        normX: Float,
+        normY: Float,
         deltaY: Float
     )
 

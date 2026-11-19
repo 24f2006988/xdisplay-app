@@ -89,17 +89,12 @@ pub fn detach_if(still_wanted: impl FnOnce() -> bool) {
 fn attach_via_ccd() -> bool {
     use windows::Win32::Devices::Display::*;
     use windows::Win32::Foundation::WIN32_ERROR;
-    use windows::Win32::System::StationsAndDesktops::{OpenDesktopW, SetThreadDesktop, DESKTOP_CONTROL_FLAGS};
-    use windows::core::w;
 
     const DISPLAYCONFIG_PATH_ACTIVE: u32 = 0x00000001;
     const DISPLAYCONFIG_PATH_MODE_IDX_INVALID: u32 = 0xffff_ffff;
 
+    crate::shared::attach_to_default_desktop();
     unsafe {
-        if let Ok(hdesk) = OpenDesktopW(w!("Default"), DESKTOP_CONTROL_FLAGS(0), false, 0x01FF) {
-            let _ = SetThreadDesktop(hdesk);
-        }
-
         let mut path_count = 0u32;
         let mut mode_count = 0u32;
         if GetDisplayConfigBufferSizes(QDC_ALL_PATHS, &mut path_count, &mut mode_count) != WIN32_ERROR(0) {
@@ -159,16 +154,11 @@ fn attach_via_ccd() -> bool {
 fn detach_via_ccd() -> bool {
     use windows::Win32::Devices::Display::*;
     use windows::Win32::Foundation::WIN32_ERROR;
-    use windows::Win32::System::StationsAndDesktops::{OpenDesktopW, SetThreadDesktop, DESKTOP_CONTROL_FLAGS};
-    use windows::core::w;
 
     const DISPLAYCONFIG_PATH_ACTIVE: u32 = 0x00000001;
 
+    crate::shared::attach_to_default_desktop();
     unsafe {
-        if let Ok(hdesk) = OpenDesktopW(w!("Default"), DESKTOP_CONTROL_FLAGS(0), false, 0x01FF) {
-            let _ = SetThreadDesktop(hdesk);
-        }
-
         let mut path_count = 0u32;
         let mut mode_count = 0u32;
         if GetDisplayConfigBufferSizes(QDC_ALL_PATHS, &mut path_count, &mut mode_count) != WIN32_ERROR(0) {
@@ -373,14 +363,16 @@ fn spawn_guard() {
 
 /// Guard process body: waits for the host `pid` to exit, then detaches the virtual monitor.
 pub fn run_guard(pid: u32) {
-    use windows::Win32::Foundation::WAIT_OBJECT_0;
+    use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
     use windows::Win32::System::Threading::{OpenProcess, WaitForSingleObject, INFINITE, PROCESS_SYNCHRONIZE};
     let Ok(host) = (unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) }) else {
         // The host is already gone.
         detach();
         return;
     };
-    if unsafe { WaitForSingleObject(host, INFINITE) } == WAIT_OBJECT_0 {
+    let waited = unsafe { WaitForSingleObject(host, INFINITE) };
+    let _ = unsafe { CloseHandle(host) };
+    if waited == WAIT_OBJECT_0 {
         detach();
     }
 }

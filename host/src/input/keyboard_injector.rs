@@ -22,6 +22,7 @@ impl KeyboardInjector {
     pub fn release_all(&self) {
         #[cfg(windows)]
         {
+            crate::shared::attach_to_default_desktop();
             let mut held = self.held_keys.lock().unwrap_or_else(|e| e.into_inner());
             if held.is_empty() {
                 return;
@@ -46,6 +47,65 @@ impl KeyboardInjector {
         }
     }
 
+    /// Computes the sequence of `(vk_code, key_up)` transitions for `event` while updating `held`.
+    fn plan_key_transitions(held: &mut HashSet<u16>, event: &KeyEvent) -> Vec<(u16, bool)> {
+        let mut out = Vec::with_capacity(8);
+        let ctrl = (event.modifiers & key_modifiers::CTRL) != 0;
+        let shift = (event.modifiers & key_modifiers::SHIFT) != 0;
+        let alt = (event.modifiers & key_modifiers::ALT) != 0;
+
+        match event.action {
+            key_actions::KEY_DOWN => {
+                if ctrl && held.insert(vk_codes::VK_CONTROL) {
+                    out.push((vk_codes::VK_CONTROL, false));
+                }
+                if shift && held.insert(vk_codes::VK_SHIFT) {
+                    out.push((vk_codes::VK_SHIFT, false));
+                }
+                if alt && held.insert(vk_codes::VK_MENU) {
+                    out.push((vk_codes::VK_MENU, false));
+                }
+                if held.insert(event.vk_code) {
+                    out.push((event.vk_code, false));
+                }
+            }
+            key_actions::KEY_UP => {
+                if held.remove(&event.vk_code) {
+                    out.push((event.vk_code, true));
+                }
+                if alt && held.remove(&vk_codes::VK_MENU) {
+                    out.push((vk_codes::VK_MENU, true));
+                }
+                if shift && held.remove(&vk_codes::VK_SHIFT) {
+                    out.push((vk_codes::VK_SHIFT, true));
+                }
+                if ctrl && held.remove(&vk_codes::VK_CONTROL) {
+                    out.push((vk_codes::VK_CONTROL, true));
+                }
+            }
+            key_actions::KEY_TAP => {
+                // Only press and release modifiers that are not already latched by the sidebar,
+                // otherwise tapping Undo (Ctrl+Z) while Ctrl is latched would silently un-latch it.
+                let press_ctrl = ctrl && !held.contains(&vk_codes::VK_CONTROL);
+                let press_shift = shift && !held.contains(&vk_codes::VK_SHIFT);
+                let press_alt = alt && !held.contains(&vk_codes::VK_MENU);
+
+                if press_ctrl { out.push((vk_codes::VK_CONTROL, false)); }
+                if press_shift { out.push((vk_codes::VK_SHIFT, false)); }
+                if press_alt { out.push((vk_codes::VK_MENU, false)); }
+
+                out.push((event.vk_code, false));
+                out.push((event.vk_code, true));
+
+                if press_alt { out.push((vk_codes::VK_MENU, true)); }
+                if press_shift { out.push((vk_codes::VK_SHIFT, true)); }
+                if press_ctrl { out.push((vk_codes::VK_CONTROL, true)); }
+            }
+            _ => {}
+        }
+        out
+    }
+
     pub fn inject(&self, event: &KeyEvent) {
         // Sanitize virtual key code: must be a valid non-zero virtual key code,
         // and reject Windows keys (0x5B, 0x5C) to prevent rogue desktop hijacking.
@@ -55,59 +115,14 @@ impl KeyboardInjector {
 
         #[cfg(windows)]
         {
-            let mut inputs = Vec::with_capacity(6);
+            crate::shared::attach_to_default_desktop();
             let mut held = self.held_keys.lock().unwrap_or_else(|e| e.into_inner());
-
-            let ctrl = (event.modifiers & key_modifiers::CTRL) != 0;
-            let shift = (event.modifiers & key_modifiers::SHIFT) != 0;
-            let alt = (event.modifiers & key_modifiers::ALT) != 0;
-
-            match event.action {
-                key_actions::KEY_DOWN => {
-                    if ctrl && held.insert(vk_codes::VK_CONTROL) {
-                        inputs.push(make_key_input(vk_codes::VK_CONTROL, false));
-                    }
-                    if shift && held.insert(vk_codes::VK_SHIFT) {
-                        inputs.push(make_key_input(vk_codes::VK_SHIFT, false));
-                    }
-                    if alt && held.insert(vk_codes::VK_MENU) {
-                        inputs.push(make_key_input(vk_codes::VK_MENU, false));
-                    }
-                    if held.insert(event.vk_code) {
-                        inputs.push(make_key_input(event.vk_code, false));
-                    }
-                }
-                key_actions::KEY_UP => {
-                    if held.remove(&event.vk_code) {
-                        inputs.push(make_key_input(event.vk_code, true));
-                    }
-                    if alt && held.remove(&vk_codes::VK_MENU) {
-                        inputs.push(make_key_input(vk_codes::VK_MENU, true));
-                    }
-                    if shift && held.remove(&vk_codes::VK_SHIFT) {
-                        inputs.push(make_key_input(vk_codes::VK_SHIFT, true));
-                    }
-                    if ctrl && held.remove(&vk_codes::VK_CONTROL) {
-                        inputs.push(make_key_input(vk_codes::VK_CONTROL, true));
-                    }
-                }
-                key_actions::KEY_TAP => {
-                    // Tap with optional modifiers (e.g. Ctrl+Z)
-                    if ctrl { inputs.push(make_key_input(vk_codes::VK_CONTROL, false)); }
-                    if shift { inputs.push(make_key_input(vk_codes::VK_SHIFT, false)); }
-                    if alt { inputs.push(make_key_input(vk_codes::VK_MENU, false)); }
-
-                    inputs.push(make_key_input(event.vk_code, false));
-                    inputs.push(make_key_input(event.vk_code, true));
-
-                    if alt { inputs.push(make_key_input(vk_codes::VK_MENU, true)); }
-                    if shift { inputs.push(make_key_input(vk_codes::VK_SHIFT, true)); }
-                    if ctrl { inputs.push(make_key_input(vk_codes::VK_CONTROL, true)); }
-                }
-                _ => {}
-            }
-
-            if !inputs.is_empty() {
+            let transitions = Self::plan_key_transitions(&mut held, event);
+            if !transitions.is_empty() {
+                let inputs: Vec<INPUT> = transitions
+                    .into_iter()
+                    .map(|(vk, key_up)| make_key_input(vk, key_up))
+                    .collect();
                 unsafe {
                     SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
                 }
@@ -115,7 +130,8 @@ impl KeyboardInjector {
         }
         #[cfg(not(windows))]
         {
-            let _ = event;
+            let mut held = self.held_keys.lock().unwrap_or_else(|e| e.into_inner());
+            let _ = Self::plan_key_transitions(&mut held, event);
         }
     }
 }
@@ -157,5 +173,25 @@ mod tests {
         let zero_event = KeyEvent::new(0, key_actions::KEY_DOWN, 0);
         injector.inject(&zero_event);
         assert!(!injector.held_keys.lock().unwrap().contains(&0));
+    }
+
+    #[test]
+    fn key_tap_preserves_already_latched_modifiers() {
+        let mut held = HashSet::new();
+        // Sidebar latches Ctrl.
+        let down = KeyboardInjector::plan_key_transitions(
+            &mut held,
+            &KeyEvent::new(vk_codes::VK_CONTROL, key_actions::KEY_DOWN, key_modifiers::NONE),
+        );
+        assert_eq!(down, vec![(vk_codes::VK_CONTROL, false)]);
+        assert!(held.contains(&vk_codes::VK_CONTROL));
+
+        // Tapping Undo (Ctrl+Z) must NOT emit a synthetic Ctrl-Up that breaks the latch.
+        let tap = KeyboardInjector::plan_key_transitions(
+            &mut held,
+            &KeyEvent::new(vk_codes::VK_Z, key_actions::KEY_TAP, key_modifiers::CTRL),
+        );
+        assert_eq!(tap, vec![(vk_codes::VK_Z, false), (vk_codes::VK_Z, true)]);
+        assert!(held.contains(&vk_codes::VK_CONTROL));
     }
 }

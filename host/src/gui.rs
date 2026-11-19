@@ -1,12 +1,13 @@
 use std::io::{BufRead, BufReader};
 use std::ffi::OsStr;
+use std::net::Ipv4Addr;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 use windows::core::PCWSTR;
@@ -25,17 +26,17 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow, IsWindowVisible,
     DispatchMessageW, GetClientRect, GetCursorPos, GetMessageW, InsertMenuW, KillTimer, LoadIconW,
-    PostQuitMessage, RegisterClassW, SetForegroundWindow, SetTimer, ShowWindow, TrackPopupMenu,
+    PostMessageW, PostQuitMessage, RegisterClassW, SetForegroundWindow, SetTimer, ShowWindow, TrackPopupMenu,
     RegisterWindowMessageW, TranslateMessage, HICON, HMENU, IDI_APPLICATION, MF_BYPOSITION, MF_GRAYED, MF_SEPARATOR, MF_STRING,
     MSG, SW_HIDE, SW_RESTORE, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RIGHTBUTTON,
     WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_ENDSESSION, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
-    WM_ERASEBKGND, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_RBUTTONUP, WM_TIMER, WM_USER, WNDCLASSW,
+    WM_ERASEBKGND, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NULL, WM_PAINT, WM_RBUTTONUP, WM_TIMER, WM_USER, WNDCLASSW,
     MessageBoxW, IDYES, MB_ICONQUESTION, MB_YESNO, WS_CAPTION, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU,
     WS_VISIBLE,
 };
 
-use crate::shared::HostShared;
-use crate::transport::lan_addresses;
+use crate::shared::{HostShared, LinkKind};
+use crate::transport::{lan_addresses, usb_tether_addresses};
 
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 const WM_TRAYICON: u32 = WM_USER + 100;
@@ -256,6 +257,7 @@ pub fn spawn_adb_watcher(shared: Arc<HostShared>) {
 
                 let Some(stdout) = child.stdout.take() else {
                     let _ = child.kill();
+                    let _ = child.wait();
                     thread::sleep(Duration::from_secs(10));
                     continue;
                 };
@@ -276,6 +278,7 @@ pub fn spawn_adb_watcher(shared: Arc<HostShared>) {
                     }
                 }
                 let _ = child.kill();
+                let _ = child.wait();
                 if shared.is_running.load(Ordering::Relaxed) {
                     // Only recover from an exited ADB server; this is not a device poll.
                     thread::sleep(Duration::from_secs(2));
@@ -290,6 +293,39 @@ pub fn spawn_adb_watcher(shared: Arc<HostShared>) {
 static GLOBAL_SHARED: OnceLock<Arc<HostShared>> = OnceLock::new();
 static GLOBAL_STATUS_MSG: Mutex<Option<String>> = Mutex::new(None);
 static TEST_STYLUS_POS: Mutex<Option<(i32, i32, f32)>> = Mutex::new(None);
+struct CachedAddresses {
+    at: Instant,
+    tethers: Vec<Ipv4Addr>,
+    lans: Vec<Ipv4Addr>,
+}
+
+static CACHED_LAN_ADDRS: Mutex<Option<CachedAddresses>> = Mutex::new(None);
+
+fn cached_network_addresses() -> (Vec<Ipv4Addr>, Vec<Ipv4Addr>) {
+    const TTL: Duration = Duration::from_secs(2);
+    let mut cache = CACHED_LAN_ADDRS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(ref entry) = *cache {
+        if entry.at.elapsed() < TTL {
+            return (entry.tethers.clone(), entry.lans.clone());
+        }
+    }
+    let tethers = usb_tether_addresses();
+    let lans: Vec<Ipv4Addr> = lan_addresses().into_iter().filter(|ip| !tethers.contains(ip)).collect();
+    *cache = Some(CachedAddresses { at: Instant::now(), tethers: tethers.clone(), lans: lans.clone() });
+    (tethers, lans)
+}
+
+unsafe fn exit_app_cleanly(hwnd: HWND) -> ! {
+    if let Some(shared) = GLOBAL_SHARED.get() {
+        shared.is_running.store(false, Ordering::SeqCst);
+    }
+    let _ = KillTimer(hwnd, TIMER_TELEMETRY);
+    let nid = tray_icon_data(hwnd);
+    let _ = Shell_NotifyIconW(NIM_DELETE, &nid);
+    crate::capture::virtual_display::detach();
+    PostQuitMessage(0);
+    std::process::exit(0);
+}
 
 fn set_status(msg: impl Into<String>) {
     *GLOBAL_STATUS_MSG.lock().unwrap_or_else(|e| e.into_inner()) = Some(msg.into());
@@ -433,14 +469,14 @@ unsafe extern "system" fn dashboard_window_proc(
         // it first is what made the dashboard flash on every telemetry tick.
         WM_ERASEBKGND => LRESULT(1),
         WM_LBUTTONDOWN => {
-            let x = (lparam.0 & 0xFFFF) as i32;
-            let y = ((lparam.0 >> 16) & 0xFFFF) as i32;
+            let x = (lparam.0 & 0xFFFF) as i16 as i32;
+            let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
             handle_click(hwnd, x, y);
             LRESULT(0)
         }
         WM_MOUSEMOVE => {
-            let x = (lparam.0 & 0xFFFF) as i32;
-            let y = ((lparam.0 >> 16) & 0xFFFF) as i32;
+            let x = (lparam.0 & 0xFFFF) as i16 as i32;
+            let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
             // Check if cursor is inside the test canvas area
             if (TEST_BOX.left..=TEST_BOX.right).contains(&x) && (TEST_BOX.top..=TEST_BOX.bottom).contains(&y) {
                 let pressure = if (wparam.0 & 0x0001) != 0 { 0.85f32 } else { 0.25f32 };
@@ -468,12 +504,7 @@ unsafe extern "system" fn dashboard_window_proc(
                     let _ = InvalidateRect(hwnd, None, false);
                 }
                 ID_TRAY_EXIT => {
-                    if let Some(shared) = GLOBAL_SHARED.get() {
-                        shared.is_running.store(false, Ordering::SeqCst);
-                    }
-                    crate::capture::virtual_display::detach();
-                    PostQuitMessage(0);
-                    std::process::exit(0);
+                    exit_app_cleanly(hwnd);
                 }
                 _ => {}
             }
@@ -522,6 +553,7 @@ unsafe fn show_tray_menu(hwnd: HWND) {
         hwnd,
         None,
     );
+    let _ = PostMessageW(hwnd, WM_NULL, WPARAM(0), LPARAM(0));
     let _ = DestroyMenu(menu);
 }
 
@@ -656,12 +688,16 @@ unsafe fn paint_dashboard(hwnd: HWND, hdc: HDC) {
     let session = shared.session.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let (badge_border_col, badge_text, badge_col) = match (&session, is_connected) {
         (Some(info), true) => {
-            let name: String = info.device_name.chars().take(16).collect();
-            let link = if info.remote { "Wi-Fi 🔒" } else { "USB" };
+            let name: String = info.device_name.chars().take(14).collect();
+            let link = match info.link {
+                LinkKind::UsbCable => "USB",
+                LinkKind::UsbTether => "USB Tether 🔒",
+                LinkKind::Wifi => "Wi-Fi 🔒",
+            };
             (green, format!("● {name} · {link}"), green)
         }
         (_, true) => (green, "● CONNECTED (Streaming)".to_string(), green),
-        _ => (yellow, "○ READY (Waiting for USB/Wi-Fi)".to_string(), yellow),
+        _ => (yellow, "○ READY (USB Tether / Wi-Fi)".to_string(), yellow),
     };
     draw_card_box(hdc, &badge_rect, card_bg, badge_border_col);
     SelectObject(hdc, font_badge);
@@ -677,7 +713,7 @@ unsafe fn paint_dashboard(hwnd: HWND, hdc: HDC) {
     let c1 = RECT { left: 24, top: grid_y, right: 24 + card_w, bottom: grid_y + card_h };
     draw_card_box(hdc, &c1, card_bg, card_border);
     let port_text = format!("Port {}", shared.tcp_port.load(Ordering::Relaxed));
-    draw_card_content(hdc, &c1, "TRANSPORT", &port_text, "ADB Reverse & Wi-Fi", cyan, text_bright, text_muted, font_small, font_section);
+    draw_card_content(hdc, &c1, "TRANSPORT", &port_text, "USB Tether & Wi-Fi", cyan, text_bright, text_muted, font_small, font_section);
 
     // Card 2: Display
     let c2 = RECT { left: 198, top: grid_y, right: 198 + card_w, bottom: grid_y + card_h };
@@ -728,12 +764,12 @@ unsafe fn paint_dashboard(hwnd: HWND, hdc: HDC) {
     let s2_rect = RECT { left: 24, top: act_y, right: 300, bottom: act_y + 24 };
     draw_text_helper(hdc, "🛠️ Quick Actions", &s2_rect, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
 
-    // 5. Wi-Fi & Pairing
+    // 5. USB Tethering & Wi-Fi Pairing
     let wifi_y = 365;
     SelectObject(hdc, font_section);
     SetTextColor(hdc, text_bright);
-    let s_wifi = RECT { left: 24, top: wifi_y, right: 400, bottom: wifi_y + 24 };
-    draw_text_helper(hdc, "📡 Wi-Fi & Pairing", &s_wifi, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+    let s_wifi = RECT { left: 24, top: wifi_y, right: 440, bottom: wifi_y + 24 };
+    draw_text_helper(hdc, "📡 USB Tethering & Wi-Fi Pairing", &s_wifi, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
     draw_card_box(hdc, &PAIRING_CARD, card_bg, card_border);
 
     let pin = shared.pairing.pin();
@@ -756,15 +792,24 @@ unsafe fn paint_dashboard(hwnd: HWND, hdc: HDC) {
     };
     draw_text_helper(hdc, &hint, &pin_hint, DT_LEFT | DT_SINGLELINE);
 
-    let addrs = lan_addresses();
-    let addr_text = if addrs.is_empty() {
-        "No network connection".to_string()
+    let (tether_addrs, lan_addrs) = cached_network_addresses();
+    let (addr_title, addr_text) = if !tether_addrs.is_empty() {
+        let mut parts: Vec<String> = tether_addrs.iter().take(1).map(|a| format!("USB: {a}")).collect();
+        for a in lan_addrs.iter().take(2) {
+            parts.push(a.to_string());
+        }
+        ("USB TETHERING READY · NETWORK", parts.join("  ·  "))
+    } else if !lan_addrs.is_empty() {
+        (
+            "THIS PC ON THE NETWORK",
+            lan_addrs.iter().take(3).map(|a| a.to_string()).collect::<Vec<_>>().join("  ·  "),
+        )
     } else {
-        addrs.iter().take(3).map(|a| a.to_string()).collect::<Vec<_>>().join("  ·  ")
+        ("THIS PC ON THE NETWORK", "Plug in USB Tethering or connect to Wi-Fi".to_string())
     };
-    SetTextColor(hdc, cyan);
-    let addr_hdr = RECT { left: 260, top: PAIRING_CARD.top + 8, right: 540, bottom: PAIRING_CARD.top + 24 };
-    draw_text_helper(hdc, "THIS PC ON THE NETWORK", &addr_hdr, DT_LEFT | DT_SINGLELINE);
+    SetTextColor(hdc, if !tether_addrs.is_empty() { green } else { cyan });
+    let addr_hdr = RECT { left: 260, top: PAIRING_CARD.top + 8, right: 545, bottom: PAIRING_CARD.top + 24 };
+    draw_text_helper(hdc, addr_title, &addr_hdr, DT_LEFT | DT_SINGLELINE);
     SelectObject(hdc, font_body);
     SetTextColor(hdc, text_bright);
     let addr_rect = RECT { left: 260, top: PAIRING_CARD.top + 28, right: 545, bottom: PAIRING_CARD.top + 48 };
@@ -825,13 +870,13 @@ unsafe fn paint_dashboard(hwnd: HWND, hdc: HDC) {
     let _ = DeleteObject(font_badge);
 }
 
-unsafe fn draw_card_box(hdc: HDC, rect: &RECT, fill_color: COLORREF, border_color: COLORREF) {
+unsafe fn draw_rounded_box(hdc: HDC, rect: &RECT, fill_color: COLORREF, border_color: COLORREF, radius: i32) {
     let brush = CreateSolidBrush(fill_color);
     let pen = CreatePen(PS_SOLID, 1, border_color);
     let old_brush = SelectObject(hdc, brush);
     let old_pen = SelectObject(hdc, pen);
 
-    let _ = RoundRect(hdc, rect.left, rect.top, rect.right, rect.bottom, 12, 12);
+    let _ = RoundRect(hdc, rect.left, rect.top, rect.right, rect.bottom, radius, radius);
 
     SelectObject(hdc, old_brush);
     SelectObject(hdc, old_pen);
@@ -839,18 +884,12 @@ unsafe fn draw_card_box(hdc: HDC, rect: &RECT, fill_color: COLORREF, border_colo
     let _ = DeleteObject(pen);
 }
 
+unsafe fn draw_card_box(hdc: HDC, rect: &RECT, fill_color: COLORREF, border_color: COLORREF) {
+    draw_rounded_box(hdc, rect, fill_color, border_color, 12);
+}
+
 unsafe fn draw_button_box(hdc: HDC, rect: &RECT, fill_color: COLORREF, border_color: COLORREF) {
-    let brush = CreateSolidBrush(fill_color);
-    let pen = CreatePen(PS_SOLID, 1, border_color);
-    let old_brush = SelectObject(hdc, brush);
-    let old_pen = SelectObject(hdc, pen);
-
-    let _ = RoundRect(hdc, rect.left, rect.top, rect.right, rect.bottom, 8, 8);
-
-    SelectObject(hdc, old_brush);
-    SelectObject(hdc, old_pen);
-    let _ = DeleteObject(brush);
-    let _ = DeleteObject(pen);
+    draw_rounded_box(hdc, rect, fill_color, border_color, 8);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -928,18 +967,9 @@ unsafe fn handle_click(hwnd: HWND, x: i32, y: i32) {
     for btn in buttons {
         if x >= btn.rect.left && x <= btn.rect.right && y >= btn.rect.top && y <= btn.rect.bottom {
             match btn.id {
-                ActionId::Fps60 => {
-                    shared.target_fps.store(60, Ordering::Relaxed);
-                    shared.reconfigure_encoder.store(true, Ordering::Relaxed);
-                }
-                ActionId::Fps90 => {
-                    shared.target_fps.store(90, Ordering::Relaxed);
-                    shared.reconfigure_encoder.store(true, Ordering::Relaxed);
-                }
-                ActionId::Fps120 => {
-                    shared.target_fps.store(120, Ordering::Relaxed);
-                    shared.reconfigure_encoder.store(true, Ordering::Relaxed);
-                }
+                ActionId::Fps60 => shared.choose_fps(60),
+                ActionId::Fps90 => shared.choose_fps(90),
+                ActionId::Fps120 => shared.choose_fps(120),
                 ActionId::BitrateAuto => {
                     shared.choose_auto_bitrate();
                 }
@@ -1005,10 +1035,7 @@ unsafe fn handle_click(hwnd: HWND, x: i32, y: i32) {
                     }
                 }
                 ActionId::ExitApp => {
-                    shared.is_running.store(false, Ordering::SeqCst);
-                    crate::capture::virtual_display::detach();
-                    PostQuitMessage(0);
-                    std::process::exit(0);
+                    exit_app_cleanly(hwnd);
                 }
             }
             let _ = InvalidateRect(hwnd, None, false);

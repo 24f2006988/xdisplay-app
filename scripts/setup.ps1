@@ -66,14 +66,14 @@ if (Get-Service UsbDk -ErrorAction SilentlyContinue) {
     Ok "USB works over USB debugging (adb); no extra driver needed."
 }
 
-# 2. Firewall
-Step 2 "Windows Firewall (lets the tablet reach this PC over Wi-Fi)"
-$rules = @(Get-NetFirewallRule -DisplayName "XDisplay Host (Wi-Fi*" -ErrorAction SilentlyContinue | Where-Object Enabled -eq True)
-if ($rules.Count -ge 2) { Ok "Already allowed (local network only)." }
+# 2. Firewall + USB Tethering
+Step 2 "Windows Firewall (lets any Android device connect over USB Tethering & Wi-Fi)"
+$rules = @(Get-NetFirewallRule -DisplayName "XDisplay Host (*" -ErrorAction SilentlyContinue | Where-Object Enabled -eq True)
+if ($rules.Count -ge 4) { Ok "Already allowed (USB Tethering + Private Wi-Fi)." }
 else {
-    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root "scripts\setup_wifi_firewall.ps1")
-    $rules = @(Get-NetFirewallRule -DisplayName "XDisplay Host (Wi-Fi*" -ErrorAction SilentlyContinue | Where-Object Enabled -eq True)
-    if ($rules.Count -ge 2) { Ok "Rules added." } else { Warn "Firewall rules missing (Wi-Fi mode will not connect)."; $todo.Add("Run scripts\setup_wifi_firewall.ps1 as administrator.") }
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root "scripts\setup_usb_tethering.ps1") -Quiet
+    $rules = @(Get-NetFirewallRule -DisplayName "XDisplay Host (*" -ErrorAction SilentlyContinue | Where-Object Enabled -eq True)
+    if ($rules.Count -ge 2) { Ok "Rules added." } else { Warn "Firewall rules missing (USB Tethering / Wi-Fi will not connect)."; $todo.Add("Run XDisplay-USB-Tethering-Setup.cmd as administrator.") }
 }
 $public = @(Get-NetConnectionProfile -ErrorAction SilentlyContinue | Where-Object NetworkCategory -eq "Public")
 if ($public.Count -gt 0) {

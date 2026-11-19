@@ -284,12 +284,23 @@ fn run_manager(winusb: Context, shared: Arc<HostShared>) {
                 accessory_scans.remove(&port);
                 bridge_active.store(true, Ordering::Release);
                 let (shared, active) = (shared.clone(), bridge_active.clone());
-                thread::spawn(move || {
+                let spawned = thread::Builder::new().name("xdisplay-aoa-rx".into()).spawn(move || {
+                    struct ClearOnDrop(Arc<AtomicBool>);
+                    impl Drop for ClearOnDrop {
+                        fn drop(&mut self) {
+                            self.0.store(false, Ordering::Release);
+                        }
+                    }
+                    let _clear = ClearOnDrop(active);
+                    crate::shared::raise_thread_priority();
                     if let Err(e) = bridge(opened, &shared) {
                         info!("USB accessory bridge ended: {e}");
                     }
-                    active.store(false, Ordering::Release);
                 });
+                if let Err(e) = spawned {
+                    warn!("Could not spawn USB accessory bridge thread: {e}");
+                    bridge_active.store(false, Ordering::Release);
+                }
                 continue;
             }
 
@@ -472,6 +483,7 @@ impl Session {
             let (handle, done, mut tcp) = (handle.clone(), done.clone(), tcp.try_clone()?);
             let (endpoint, packet) = (ep.bulk_out, ep.out_packet);
             thread::Builder::new().name("xdisplay-aoa-tx".into()).spawn(move || {
+                crate::shared::raise_thread_priority();
                 tcp_to_usb(&handle, endpoint, packet, &mut tcp, &done);
                 done.store(true, Ordering::Release);
             })?
