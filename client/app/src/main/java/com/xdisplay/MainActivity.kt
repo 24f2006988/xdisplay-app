@@ -248,6 +248,8 @@ class MainActivity : Activity(), SurfaceHolder.Callback, View.OnTouchListener, V
             store.saveCredential(credential)
             val id = credential.substringBefore(':', "")
             if (id.isNotEmpty()) targetHostId = id
+            // The one-time PIN has been consumed; future reconnects must resume with the stored secret.
+            pinUsed = ""
         }
     }
 

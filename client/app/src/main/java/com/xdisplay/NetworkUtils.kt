@@ -67,6 +67,10 @@ object NetworkUtils {
     /** Opens Android's USB Tethering screen directly when available, falling back to Network settings. */
     fun openUsbTetheringSettings(context: Context) {
         val candidates = listOf(
+            // Standard exported action on Android 11-16 (Pixel, Xiaomi HyperOS, Samsung OneUI, OnePlus).
+            Intent("android.settings.TETHER_SETTINGS"),
+            Intent().setClassName("com.android.settings", "com.android.settings.Settings\$TetherSettingsActivity"),
+            // Legacy Android 8-10 component name.
             Intent().setClassName("com.android.settings", "com.android.settings.TetherSettings"),
             Intent(Settings.ACTION_WIRELESS_SETTINGS),
             Intent(Settings.ACTION_SETTINGS)

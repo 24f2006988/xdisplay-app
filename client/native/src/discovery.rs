@@ -10,9 +10,9 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use xdisplay_common::discovery::{HostAnnouncement, DISCOVERY_PORT, PROBE};
@@ -81,6 +81,9 @@ pub struct Discovery {
     running: Arc<AtomicBool>,
     /// Bumped on every start so a stale scanner thread exits instead of doubling up.
     generation: Arc<AtomicU64>,
+    /// Port the active scanner thread is bound to, used to wake `recv_from` immediately on stop.
+    bound_port: Arc<AtomicU16>,
+    worker: Mutex<Option<JoinHandle<()>>>,
     hosts: Arc<Mutex<HashMap<HostId, Seen>>>,
     interfaces: Arc<Mutex<Vec<ProbeInterface>>>,
     /// Set when interfaces change so a new USB tethering subnet is probed immediately.
@@ -88,6 +91,23 @@ pub struct Discovery {
 }
 
 impl Discovery {
+    fn wake_socket(&self) {
+        let port = self.bound_port.load(Ordering::Acquire);
+        if port != 0 {
+            if let Ok(sock) = UdpSocket::bind(("127.0.0.1", 0)) {
+                let _ = sock.send_to(&[0u8], SocketAddr::from(([127, 0, 0, 1], port)));
+            }
+        }
+    }
+
+    fn stop_and_join(&self) {
+        self.running.store(false, Ordering::SeqCst);
+        self.wake_socket();
+        if let Some(handle) = self.worker.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            let _ = handle.join();
+        }
+    }
+
     /// Updates active IPv4 interfaces reported by Android so probes reach USB tethering subnets.
     pub fn set_interfaces(&self, spec: &str) {
         let parsed = parse_interfaces(spec);
@@ -108,16 +128,20 @@ impl Discovery {
             });
             drop(hosts);
             self.probe_now.store(true, Ordering::Release);
+            self.wake_socket();
         }
     }
 
     pub fn start(&self) {
+        // Ensure any previous scanner releases UDP 59101 before the new thread binds it.
+        self.stop_and_join();
         let gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         self.running.store(true, Ordering::SeqCst);
         self.probe_now.store(true, Ordering::Release);
-        let (running, generation, hosts, interfaces, probe_now) = (
+        let (running, generation, bound_port, hosts, interfaces, probe_now) = (
             self.running.clone(),
             self.generation.clone(),
+            self.bound_port.clone(),
             self.hosts.clone(),
             self.interfaces.clone(),
             self.probe_now.clone(),
@@ -135,6 +159,9 @@ impl Discovery {
                     return;
                 }
             };
+            if let Ok(local) = socket.local_addr() {
+                bound_port.store(local.port(), Ordering::Release);
+            }
             let _ = socket.set_broadcast(true);
             let _ = socket.set_read_timeout(Some(POLL));
             log::info!("Scanning for XDisplay hosts (USB Tethering & Wi-Fi)");
@@ -165,6 +192,9 @@ impl Discovery {
                     next_probe = Instant::now() + PROBE_INTERVAL;
                 }
                 if let Ok((len, from)) = socket.recv_from(&mut buf) {
+                    if !alive() {
+                        break;
+                    }
                     if let Some(ann) = HostAnnouncement::parse(&buf[..len]) {
                         let is_usb = {
                             let ifaces = interfaces.lock().unwrap_or_else(|e| e.into_inner());
@@ -175,15 +205,17 @@ impl Discovery {
                 }
                 hosts.lock().unwrap_or_else(|e| e.into_inner()).retain(|_, h| h.last_seen.elapsed() < HOST_TTL);
             }
+            bound_port.store(0, Ordering::Release);
             hosts.lock().unwrap_or_else(|e| e.into_inner()).clear();
         });
-        if let Err(e) = spawned {
-            log::warn!("Could not start the discovery thread: {e}");
+        match spawned {
+            Ok(handle) => *self.worker.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle),
+            Err(e) => log::warn!("Could not start the discovery thread: {e}"),
         }
     }
 
     pub fn stop(&self) {
-        self.running.store(false, Ordering::SeqCst);
+        self.stop_and_join();
     }
 
     /// One host per line: `ip|port|name|host_id_hex|usb` (or `wifi`), USB-tethered hosts first,
