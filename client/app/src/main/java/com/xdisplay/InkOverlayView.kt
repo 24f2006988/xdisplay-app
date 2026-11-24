@@ -97,6 +97,9 @@ class InkOverlayView(context: Context) : View(context) {
     private var cursorScreenX = 0f
     private var cursorScreenY = 0f
     private var cursorShape = NativeEngine.CURSOR_SHAPE_ARROW
+    /** Cursor polling is wanted while the hosting activity is resumed. */
+    private var vsyncWanted = false
+    /** True only while the Choreographer callback is actually queued. */
     private var vsyncRunning = false
     private val arrowPath = android.graphics.Path()
 
@@ -449,23 +452,37 @@ class InkOverlayView(context: Context) : View(context) {
     }
 
     fun setVsyncActive(active: Boolean) {
-        if (active == vsyncRunning) return
-        vsyncRunning = active
-        val choreographer = android.view.Choreographer.getInstance()
-        choreographer.removeFrameCallback(choreographerFrameCallback)
-        if (active && isAttachedToWindow) {
-            choreographer.postFrameCallback(choreographerFrameCallback)
-        }
+        vsyncWanted = active
+        syncVsyncCallback()
     }
 
     override fun onAttachedToWindow() {
         super.onAttachedToWindow()
-        setVsyncActive(true)
+        // The activity's first onResume() still runs before this attach, so a callback requested
+        // there could not be queued yet; reconcile once the window exists.
+        syncVsyncCallback()
     }
 
     override fun onDetachedFromWindow() {
         super.onDetachedFromWindow()
-        setVsyncActive(false)
+        stopVsync()
+    }
+
+    /** Queues the frame callback iff polling is wanted and there is a window to post it on. */
+    private fun syncVsyncCallback() {
+        val shouldRun = vsyncWanted && isAttachedToWindow
+        if (shouldRun == vsyncRunning) return
+        if (shouldRun) {
+            vsyncRunning = true
+            android.view.Choreographer.getInstance().postFrameCallback(choreographerFrameCallback)
+        } else {
+            stopVsync()
+        }
+    }
+
+    private fun stopVsync() {
+        vsyncRunning = false
+        android.view.Choreographer.getInstance().removeFrameCallback(choreographerFrameCallback)
     }
 
     private fun updateCursorFromNative(): Boolean {
